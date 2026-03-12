@@ -1,7 +1,0 @@
-{
-  "api": {
-    "base_url": "https://aigc.sankuai.com/v1/openai/native",
-    "model": "LongCat-Flash-Chat",
-    "token": "21904097714435223649"
-  }
-}
