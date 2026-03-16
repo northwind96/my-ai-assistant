@@ -1,7 +1,7 @@
 [package]
-name = "my-ai-assistant"
+name = "nova"
 version = "0.1.0"
-description = "A Tauri App"
+description = "Nova - AI Assistant"
 authors = ["you"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "my_ai_assistant_lib"
+name = "nova_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -29,4 +29,6 @@ chrono = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 config = "0.14"
 once_cell = "1.19"
+tauri-plugin-dialog = "2"
+base64 = "0.22"
 

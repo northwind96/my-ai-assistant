@@ -6,6 +6,7 @@ import OpenAI from "openai";
 import { Agent, run, setDefaultOpenAIKey, OpenAIChatCompletionsModel, type RunStreamEvent } from "@openai/agents";
 import { skillsLoader } from "./skills";
 import { agentTools } from "./tools";
+import { sessionManager, type Session, type SessionMessage } from "./sessionManager";
 import MarkdownRender, { getMarkdown, parseMarkdownToStructure, type ParsedNode } from 'markstream-vue'
 import {
   NLayout,
@@ -20,7 +21,9 @@ import {
   NDivider,
   NIcon,
   NConfigProvider,
-  lightTheme
+  NMessageProvider,
+  lightTheme,
+  createDiscreteApi
 } from 'naive-ui'
 import {
   ChatbubbleOutline,
@@ -30,8 +33,6 @@ import {
   CopyOutline,
   RefreshOutline,
   TrashOutline,
-  MicOutline,
-  ImageOutline,
   PaperPlaneOutline,
   MenuOutline,
   ChevronDownOutline,
@@ -39,10 +40,38 @@ import {
   TimeOutline,
   PinOutline,
   ArrowDownOutline,
-  BulbOutline
+  BulbOutline,
+  DocumentTextOutline,
+  ImageOutline,
+  CloseOutline
 } from '@vicons/ionicons5'
 
 import {LinkOutlined} from '@vicons/antd'
+
+// 附件类型定义
+interface Attachment {
+  id: string;
+  path: string;
+  name: string;
+  type: 'text' | 'image' | 'document'; // text: txt/json/jsonl/csv, image: jpg/jpeg/png, document: xlsx/docx/ppt
+  extension: string;
+  size?: number;
+  base64Data?: string; // 图片的 base64 数据
+  content?: string; // 文本文件内容
+}
+
+// 最大附件数量
+const MAX_ATTACHMENTS = 5;
+
+// 支持的文件类型
+const ALLOWED_EXTENSIONS = {
+  text: ['txt', 'json', 'jsonl', 'csv', 'md'],
+  image: ['jpg', 'jpeg', 'png'],
+  document: ['xlsx', 'docx', 'ppt', 'pptx']
+};
+
+// 空附件数组常量
+const emptyAttachments: Attachment[] = [];
 
 // 消息类型定义
 interface Message {
@@ -55,12 +84,28 @@ interface Message {
   showReasoning?: boolean; // 是否展开显示思考内容
 }
 
-// 对话历史类型
+// 标签页类型定义
+interface Tab {
+  id: string;                    // 标签页唯一ID
+  chat_id: string;               // 关联的会话ID
+  title: string;                 // 标签页标题
+  mode: 'chat' | 'agent';        // 模式
+  messages: Message[];           // 该标签页的消息列表
+  session: Session | null;       // 关联的会话对象
+  attachments: Attachment[];     // 附件列表（仅Agent模式）
+  isLoading?: boolean;           // 是否正在加载
+  created_at: number;
+  updated_at: number;
+}
+
+// 对话历史类型（使用 SessionMeta）
 interface Conversation {
-  id: string;
+  chat_id: string;
   title: string;
   mode: 'chat' | 'agent';
-  timestamp: Date;
+  created_at: number;
+  updated_at: number;
+  message_count: number;
   pinned?: boolean;
 }
 
@@ -83,23 +128,74 @@ interface SkillInfo {
 type ChatMode = 'chat' | 'agent';
 
 // 响应数据
-const messages = ref<Message[]>([
-  { id: 1, content: '你好！我是AI助手，有什么可以帮您的吗？', sender: 'ai', timestamp: new Date() }
-]);
 const inputText = ref('');
 const isLoading = ref(false);
 const currentMode = ref<ChatMode>('chat');
 const skills = ref<SkillInfo[]>([]);
 const collapsed = ref(false);
+
+// 标签页状态管理
+const tabs = ref<Tab[]>([]);
+const activeTabId = ref<string>('');
+
+// 当前标签页计算属性
+const currentTab = computed(() => {
+  return tabs.value.find(t => t.id === activeTabId.value) || null;
+});
+
+// 空数组常量，避免每次返回新数组引用
+const emptyMessages: Message[] = [];
+
+// messages 改为计算属性，始终返回当前标签页的消息数组
+// 这样任何对 messages 的修改都会直接反映到标签页上
+const messages = computed({
+  get: () => {
+    const tab = currentTab.value;
+    if (tab) {
+      return tab.messages;
+    }
+    // 没有标签页时返回固定的空数组
+    return emptyMessages;
+  },
+  set: (value) => {
+    const tab = currentTab.value;
+    if (tab) {
+      tab.messages = value;
+    }
+  }
+});
+
+// attachments 也改为计算属性，始终返回当前标签页的附件数组
+const attachments = computed({
+  get: () => {
+    const tab = currentTab.value;
+    if (tab && tab.attachments) {
+      return tab.attachments;
+    }
+    return emptyAttachments;
+  },
+  set: (value) => {
+    const tab = currentTab.value;
+    if (tab) {
+      tab.attachments = value;
+    }
+  }
+});
+
 const currentConversation = ref<Conversation>({
-  id: '1',
-  title: '你是谁',
+  chat_id: '',
+  title: '新对话',
   mode: 'chat',
-  timestamp: new Date()
+  created_at: Date.now(),
+  updated_at: Date.now(),
+  message_count: 0
 });
 
 // 深度思考开关（仅 Chat 模式）
 const enableThinking = ref(false);
+
+// 消息提示 - 使用 createDiscreteApi 在 setup 外部使用 message
+const { message } = createDiscreteApi(['message']);
 
 // 聊天内容区域引用
 const chatContentRef = ref<any>(null);
@@ -149,23 +245,19 @@ watch(messages, () => {
   }
 }, { deep: true });
 
-// 对话历史（模拟数据）
-const conversations = ref<Conversation[]>([
-  { id: '1', title: '你是谁', mode: 'chat', timestamp: new Date(), pinned: false },
-  { id: '2', title: '新对话', mode: 'chat', timestamp: new Date(Date.now() - 86400000), pinned: false },
-  { id: '3', title: '新对话', mode: 'chat', timestamp: new Date(Date.now() - 86400000 * 2), pinned: false },
-  { id: '4', title: '你是谁', mode: 'chat', timestamp: new Date(Date.now() - 86400000 * 3), pinned: false },
-]);
+// 对话历史（从会话管理加载）
+const conversations = ref<Conversation[]>([]);
 
 // 置顶对话
 const pinnedConversations = computed(() => conversations.value.filter(c => c.pinned));
 // 今日对话
-const todayConversations = computed(() => conversations.value.filter(c => !c.pinned && isToday(c.timestamp)));
+const todayConversations = computed(() => conversations.value.filter(c => !c.pinned && isToday(c.updated_at)));
 // 历史对话
-const historyConversations = computed(() => conversations.value.filter(c => !c.pinned && !isToday(c.timestamp)));
+const historyConversations = computed(() => conversations.value.filter(c => !c.pinned && !isToday(c.updated_at)));
 
-function isToday(date: Date) {
+function isToday(timestamp: number) {
   const today = new Date();
+  const date = new Date(timestamp);
   return date.toDateString() === today.toDateString();
 }
 
@@ -199,72 +291,532 @@ async function loadSkills() {
   }
 }
 
-// 切换模式
-function switchMode(mode: ChatMode) {
-  currentMode.value = mode;
-  messages.value = [
-    { 
-      id: 1, 
-      content: mode === 'chat' 
-        ? '你好！我是AI助手，有什么可以帮您的吗？' 
-        : '你好！我是Agent助手，可以执行工具和Skills。', 
-      sender: 'ai', 
-      timestamp: new Date() 
-    }
-  ];
+// 标签页操作函数
+
+// 创建新标签页（异步，创建时立即持久化）
+async function createTab(mode: 'chat' | 'agent' = 'chat', title?: string) {
+  const newTab: Tab = {
+    id: `tab_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    chat_id: '',
+    title: title || '新对话',
+    mode: mode,
+    messages: [
+      {
+        id: 1,
+        content: mode === 'chat'
+          ? '你好！我是 Nova，有什么可以帮您的吗？'
+          : '你好！我是Agent助手，可以执行工具和Skills。',
+        sender: 'ai',
+        timestamp: new Date()
+      }
+    ],
+    session: null,
+    attachments: [],
+    created_at: Date.now(),
+    updated_at: Date.now()
+  };
+
+  // 立即创建会话文件（持久化）
+  try {
+    const session = await sessionManager.createSession(newTab.title, mode);
+    newTab.chat_id = session.chat_id;
+    newTab.session = session;
+  } catch (error) {
+    console.error('创建会话失败:', error);
+  }
+
+  tabs.value.push(newTab);
+  activeTabId.value = newTab.id;
+
+  // 同步会话状态（messages 和 attachments 是计算属性，会自动同步）
+  currentSession.value = newTab.session;
+
+  return newTab;
 }
 
-// 创建新对话
-function createNewConversation() {
-  const newConv: Conversation = {
-    id: Date.now().toString(),
-    title: '新对话',
-    mode: currentMode.value,
-    timestamp: new Date()
-  };
-  conversations.value.unshift(newConv);
-  currentConversation.value = newConv;
-  messages.value = [
-    { id: 1, content: '你好！有什么可以帮您的吗？', sender: 'ai', timestamp: new Date() }
-  ];
+// 切换到指定标签页
+function switchToTab(tabId: string) {
+  if (activeTabId.value === tabId) return;
+  activeTabId.value = tabId;
+  const tab = currentTab.value;
+  if (tab) {
+    currentMode.value = tab.mode;
+    currentSession.value = tab.session;
+    // messages 和 attachments 是计算属性，会自动同步
+  }
+}
+
+// 关闭标签页
+function closeTab(tabId: string, event?: Event) {
+  event?.stopPropagation();
+
+  const index = tabs.value.findIndex(t => t.id === tabId);
+  if (index === -1) return;
+
+  // 如果关闭的是当前标签页，需要切换到其他标签页
+  if (activeTabId.value === tabId) {
+    // 先移除标签页
+    tabs.value.splice(index, 1);
+
+    // 移除后再决定切换到哪个标签页
+    if (tabs.value.length > 0) {
+      // 优先切换到原索引位置的标签页（右侧那个），如果超出范围则切换到最后一个
+      const newActiveIndex = Math.min(index, tabs.value.length - 1);
+      const newActiveTab = tabs.value[newActiveIndex];
+      activeTabId.value = newActiveTab.id;
+      currentMode.value = newActiveTab.mode;
+      currentSession.value = newActiveTab.session;
+      // messages 和 attachments 是计算属性，会自动同步
+    } else {
+      // 关闭的是最后一个标签页，清空状态（跳转到首页）
+      activeTabId.value = '';
+      currentMode.value = 'chat';
+      currentSession.value = null;
+      // messages 和 attachments 是计算属性，会自动返回空数组
+    }
+  } else {
+    // 关闭的不是当前标签页，直接移除
+    tabs.value.splice(index, 1);
+  }
+}
+
+// 切换当前标签页的模式
+function switchMode(mode: ChatMode) {
+  // 只更新全局模式（用于新建对话时的默认模式）
+  // 不修改已存在标签页的模式
+  currentMode.value = mode;
+
+  // 重新加载对应模式的会话列表（不阻塞 UI）
+  loadConversationList();
+}
+
+// 新建对话（创建新标签页，使用当前选择的模式）
+async function createNewConversation() {
+  await createTab(currentMode.value);
+  loadConversationList();
+}
+
+// 当前会话对象
+const currentSession = ref<Session | null>(null);
+
+// 加载会话列表
+async function loadConversationList() {
+  try {
+    const sessions = await sessionManager.listSessions(currentMode.value, 20);
+    conversations.value = sessions.map(s => ({
+      chat_id: s.chat_id,
+      title: s.title,
+      mode: s.mode,
+      created_at: s.created_at,
+      updated_at: s.updated_at,
+      message_count: s.message_count,
+      pinned: false
+    }));
+  } catch (error) {
+    console.error('加载会话列表失败:', error);
+  }
 }
 
 // 选择对话
-function selectConversation(conv: Conversation) {
-  currentConversation.value = conv;
-  // 这里可以加载对应对话的历史消息
+async function selectConversation(conv: Conversation) {
+  // 检查是否已经有标签页打开了这个会话
+  const existingTab = tabs.value.find(t => t.chat_id === conv.chat_id);
+
+  if (existingTab) {
+    // 如果已经打开，切换到该标签页
+    switchToTab(existingTab.id);
+    return;
+  }
+
+  // 加载会话（先加载，确认会话存在）
+  const session = await sessionManager.loadSession(conv.chat_id, conv.mode);
+  if (!session) {
+    console.error('会话不存在:', conv.chat_id);
+    return;
+  }
+
+  // 创建标签页（不创建新会话文件，直接使用已有会话）
+  const newTab: Tab = {
+    id: `tab_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    chat_id: conv.chat_id,
+    title: conv.title,
+    mode: conv.mode,
+    messages: [],
+    session: session,
+    attachments: [],
+    created_at: Date.now(),
+    updated_at: Date.now()
+  };
+
+  // 将会话消息转换为 UI 消息
+  const sessionMessages = session.messages.map((msg, index) => ({
+    id: index + 1,
+    content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+    sender: msg.role === 'user' ? 'user' : 'ai',
+    timestamp: new Date(msg.timestamp)
+  }));
+
+  // 如果没有消息，添加欢迎消息
+  if (sessionMessages.length === 0) {
+    newTab.messages.push({
+      id: 1,
+      content: conv.mode === 'chat'
+        ? '你好！我是 Nova，有什么可以帮您的吗？'
+        : '你好！我是Agent助手，可以执行工具和Skills。',
+      sender: 'ai',
+      timestamp: new Date()
+    });
+  } else {
+    newTab.messages.push(...sessionMessages as Message[]);
+  }
+
+  // 添加标签页并激活
+  tabs.value.push(newTab);
+  activeTabId.value = newTab.id;
+  currentSession.value = session;
+  currentMode.value = session.mode;
+}
+
+// 保存消息到当前会话
+async function saveMessageToSession(role: 'user' | 'assistant' | 'tool', content: string, extra?: any) {
+  if (!currentSession.value) return;
+
+  const message: Omit<SessionMessage, 'id' | 'timestamp'> = {
+    role,
+    content,
+    ...extra
+  };
+
+  await sessionManager.addMessage(currentSession.value.chat_id, currentSession.value.mode, message);
+
+  // 更新当前会话
+  currentSession.value = await sessionManager.loadSession(currentSession.value.chat_id, currentSession.value.mode);
+
+  // 更新会话列表中的消息计数
+  const conv = conversations.value.find(c => c.chat_id === currentSession.value?.chat_id);
+  if (conv) {
+    conv.message_count = currentSession.value?.messages.length || 0;
+    conv.updated_at = Date.now();
+  }
+}
+
+// 生成会话标题（从用户输入截取前15个字符）
+function generateSessionTitle(userInput: string): string {
+  const maxLength = 15;
+  if (userInput.length <= maxLength) {
+    return userInput;
+  }
+  return userInput.slice(0, maxLength) + '...';
+}
+
+// 更新会话标题（如果是第一条用户消息）
+async function updateSessionTitleIfNeeded(userInput: string) {
+  if (!currentSession.value) return;
+
+  // 检查是否只有系统消息和这一条用户消息（即第一条用户消息）
+  const userMessages = currentSession.value.messages.filter(m => m.role === 'user');
+  if (userMessages.length === 1 && currentSession.value.title === '新对话') {
+    const newTitle = generateSessionTitle(userInput);
+    await sessionManager.updateSessionTitle(
+      currentSession.value.chat_id,
+      currentSession.value.mode,
+      newTitle
+    );
+
+    // 更新当前会话和会话列表
+    currentSession.value.title = newTitle;
+    const conv = conversations.value.find(c => c.chat_id === currentSession.value?.chat_id);
+    if (conv) {
+      conv.title = newTitle;
+    }
+  }
+}
+
+// 删除会话
+async function deleteConversation(conv: Conversation, event: Event) {
+  event.stopPropagation(); // 阻止冒泡，避免触发选择会话
+
+  try {
+    // 1. 先找到并关闭对应的标签页
+    const tabIndex = tabs.value.findIndex(t => t.chat_id === conv.chat_id);
+    if (tabIndex !== -1) {
+      const tab = tabs.value[tabIndex];
+      // 如果关闭的是当前激活的标签页
+      if (activeTabId.value === tab.id) {
+        // 先移除标签页
+        tabs.value.splice(tabIndex, 1);
+
+        // 切换到其他标签页或清空
+        if (tabs.value.length > 0) {
+          const newActiveIndex = Math.min(tabIndex, tabs.value.length - 1);
+          const newActiveTab = tabs.value[newActiveIndex];
+          activeTabId.value = newActiveTab.id;
+          currentMode.value = newActiveTab.mode;
+          currentSession.value = newActiveTab.session;
+          // messages 和 attachments 是计算属性，会自动同步
+        } else {
+          // 没有其他标签页了，保持当前模式，清空会话状态
+          activeTabId.value = '';
+          // 不要改变 currentMode，保持用户当前选择的模式
+          currentSession.value = null;
+          // messages 和 attachments 是计算属性，会自动返回空数组
+        }
+      } else {
+        // 不是当前标签页，直接移除
+        tabs.value.splice(tabIndex, 1);
+      }
+    }
+
+    // 2. 删除本地存储的会话文件
+    await sessionManager.deleteSession(conv.chat_id, conv.mode);
+
+    // 3. 从会话列表中移除
+    const index = conversations.value.findIndex(c => c.chat_id === conv.chat_id);
+    if (index > -1) {
+      conversations.value.splice(index, 1);
+    }
+  } catch (error) {
+    console.error('删除会话失败:', error);
+  }
+}
+
+// 获取文件类型
+function getFileType(extension: string): 'text' | 'image' | 'document' {
+  const ext = extension.toLowerCase();
+  if (ALLOWED_EXTENSIONS.text.includes(ext)) return 'text';
+  if (ALLOWED_EXTENSIONS.image.includes(ext)) return 'image';
+  return 'document';
+}
+
+// 获取文件图标
+function getFileIcon(type: 'text' | 'image' | 'document') {
+  switch (type) {
+    case 'image':
+      return ImageOutline;
+    case 'text':
+    case 'document':
+    default:
+      return DocumentTextOutline;
+  }
+}
+
+// 获取类型标签
+function getTypeLabel(type: 'text' | 'image' | 'document', extension: string) {
+  switch (type) {
+    case 'image':
+      return '图片';
+    case 'text':
+      return extension.toUpperCase();
+    case 'document':
+      return extension.toUpperCase();
+    default:
+      return '文件';
+  }
+}
+
+// 打开附件选择对话框
+async function openAttachmentDialog() {
+  // 检查附件数量限制
+  if (attachments.value.length >= MAX_ATTACHMENTS) {
+    message.warning(`最多只能上传 ${MAX_ATTACHMENTS} 个附件`);
+    return;
+  }
+
+  try {
+    // 动态导入 Tauri dialog API
+    const { open } = await import('@tauri-apps/plugin-dialog');
+
+    // 收集所有支持的扩展名
+    const allExtensions = [
+      ...ALLOWED_EXTENSIONS.text,
+      ...ALLOWED_EXTENSIONS.image,
+      ...ALLOWED_EXTENSIONS.document
+    ];
+
+    // 使用 Tauri 的 dialog API 打开文件选择器
+    const selected = await open({
+      filters: [
+        {
+          name: '支持的文件',
+          extensions: allExtensions
+        }
+      ],
+      multiple: true // 允许多选
+    });
+
+    if (selected) {
+      // 统一处理为数组
+      const files = Array.isArray(selected) ? selected : [selected];
+      const remainingSlots = MAX_ATTACHMENTS - attachments.value.length;
+
+      if (files.length > remainingSlots) {
+        message.warning(`只能再添加 ${remainingSlots} 个附件`);
+        return;
+      }
+
+      for (const filePath of files) {
+        const fileName = filePath.split('/').pop() || filePath.split('\\').pop() || '未知文件';
+        const extension = fileName.split('.').pop()?.toLowerCase() || '';
+        const fileType = getFileType(extension);
+
+        const attachment: Attachment = {
+          id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          path: filePath,
+          name: fileName,
+          type: fileType,
+          extension
+        };
+
+        attachments.value.push(attachment);
+      }
+
+      message.success(`已添加 ${files.length} 个附件`);
+    }
+  } catch (error) {
+    console.error('打开文件对话框失败:', error);
+    message.error('打开文件对话框失败');
+  }
+}
+
+// 移除附件
+function removeAttachment(id: string) {
+  const index = attachments.value.findIndex(a => a.id === id);
+  if (index > -1) {
+    attachments.value.splice(index, 1);
+  }
+}
+
+// 清空所有附件
+function clearAttachments() {
+  attachments.value = [];
+}
+
+// 读取图片为 base64
+async function readImageAsBase64(filePath: string): Promise<string> {
+  try {
+    // 使用 Tauri 读取文件为 base64
+    const base64 = await invoke<string>('read_file_as_base64', { path: filePath });
+    return base64;
+  } catch (error) {
+    console.error('读取图片失败:', error);
+    throw error;
+  }
 }
 
 // 发送消息
 async function sendMessage() {
   if (!inputText.value.trim() || !openaiClient) return;
-  
+
+  // 如果没有标签页，先创建一个
+  if (tabs.value.length === 0) {
+    await createTab(currentMode.value);
+  }
+
+  // 保存当前标签页和会话的引用
+  const targetTab = currentTab.value;
+  if (!targetTab) return;
+
+  // 如果没有当前会话，先创建一个
+  if (!currentSession.value) {
+    await createNewConversation();
+  }
+
+  // 重新获取引用（createNewConversation 可能会改变）
+  const finalTargetTab = currentTab.value;
+  const targetSession = currentSession.value;
+  if (!finalTargetTab) return;
+
+  // 构建用户消息内容
+  let userContent = inputText.value;
+
+  // 获取标签页的模式
+  const tabMode = finalTargetTab.mode;
+
+  // Agent 模式下处理附件
+  if (tabMode === 'agent' && attachments.value.length > 0) {
+    // 构建附件信息
+    const attachmentInfo = attachments.value.map(att => {
+      if (att.type === 'image') {
+        return `【图片文件: ${att.name}】路径: ${att.path}`;
+      } else if (att.type === 'text') {
+        return `【文本文件: ${att.name}】路径: ${att.path}`;
+      } else {
+        return `【文档文件: ${att.name}】路径: ${att.path}`;
+      }
+    }).join('\n');
+
+    userContent = `${userContent}\n\n附件文件：\n${attachmentInfo}`;
+  }
+
   const userMessage: Message = {
     id: Date.now(),
     content: inputText.value,
     sender: 'user',
     timestamp: new Date()
   };
-  
-  messages.value.push(userMessage);
+
+  // 检查是否只有欢迎消息（占位消息），如果是则清空
+  if (finalTargetTab.messages.length === 1 && finalTargetTab.messages[0].sender === 'ai') {
+    // 替换欢迎消息为用户消息
+    finalTargetTab.messages.length = 0;  // 清空数组但保持引用
+    finalTargetTab.messages.push(userMessage);
+  } else {
+    finalTargetTab.messages.push(userMessage);
+  }
+
   const userInput = inputText.value;
+  const attachmentsToSend = [...attachments.value]; // 保存当前附件列表
+
+  // 保存用户消息到会话（如果是替换欢迎消息的情况，需要特殊处理）
+  if (finalTargetTab.messages.length === 1) {
+    // 清空会话中的消息，重新保存
+    if (targetSession) {
+      targetSession.messages = [];
+    }
+  }
+
+  // 保存用户消息到会话
+  if (targetSession) {
+    await sessionManager.addMessage(targetSession.chat_id, targetSession.mode, {
+      role: 'user',
+      content: userContent
+    });
+  }
+
+  // 如果是第一条用户消息，更新会话标题
+  if (targetSession && targetSession.title === '新对话') {
+    const newTitle = userInput.length <= 15 ? userInput : userInput.slice(0, 15) + '...';
+    await sessionManager.updateSessionTitle(targetSession.chat_id, targetSession.mode, newTitle);
+    targetSession.title = newTitle;
+    finalTargetTab.title = newTitle;
+  }
+
   inputText.value = '';
+  finalTargetTab.attachments = []; // 清空附件
   isLoading.value = true;
-  
+
   try {
-    if (currentMode.value === 'chat') {
+    if (tabMode === 'chat') {
       await chatMode(userInput);
     } else {
-      await agentMode(userInput);
+      await agentMode(userInput, attachmentsToSend);
     }
   } catch (error) {
     console.error('请求失败:', error);
-    messages.value.push({
+    const errorMsg = '抱歉，服务暂时不可用，请稍后重试。';
+    // 写入到原始标签页
+    finalTargetTab.messages.push({
       id: Date.now(),
-      content: '抱歉，服务暂时不可用，请稍后重试。',
+      content: errorMsg,
       sender: 'ai',
       timestamp: new Date()
     });
+    if (targetSession) {
+      await sessionManager.addMessage(targetSession.chat_id, targetSession.mode, {
+        role: 'assistant',
+        content: errorMsg
+      });
+    }
   } finally {
     isLoading.value = false;
   }
@@ -274,10 +826,30 @@ async function sendMessage() {
 async function chatMode(userInput: string) {
   if (!openaiClient) return;
 
+  // 保存当前标签页的引用，防止切换标签页后写入错误的位置
+  const targetTab = currentTab.value;
+  const targetSession = currentSession.value;
+  if (!targetTab) return;
+
+  // 构建消息历史上下文
+  let messagesContext: Array<{ role: string; content: string }> = [];
+
+  if (targetSession && targetSession.messages.length > 0) {
+    // 使用会话管理器的压缩功能获取历史消息
+    const compressedHistory = sessionManager.compressMessagesForContext(targetSession.messages);
+    messagesContext = compressedHistory.map(m => ({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    }));
+  }
+
+  // 添加当前用户消息
+  messagesContext.push({ role: 'user', content: userInput });
+
   // 构建请求参数
   const requestParams: any = {
     model: 'qwen3.5-plus',
-    messages: [{ role: 'user', content: userInput }],
+    messages: messagesContext,
     stream: true,
     enable_thinking: enableThinking.value,
     max_tokens: 8192  // 设置最大输出 token 数
@@ -288,7 +860,7 @@ async function chatMode(userInput: string) {
   // 创建 AI 消息占位，用于流式更新
   const aiMessageId = Date.now();
   const md = getMarkdown();
-  messages.value.push({
+  targetTab.messages.push({
     id: aiMessageId,
     content: '',
     nodes: [],
@@ -305,13 +877,19 @@ async function chatMode(userInput: string) {
   let reasoningContent = '';
 
   for await (const chunk of stream) {
+    // 检查标签页是否还存在
+    if (!tabs.value.find(t => t.id === targetTab.id)) {
+      // 标签页已被关闭，停止处理
+      break;
+    }
+
     const delta = chunk.choices[0]?.delta;
     if (!delta) continue;
 
     // 收集思考内容
     if (delta.reasoning_content !== undefined && delta.reasoning_content !== null) {
       reasoningContent += delta.reasoning_content;
-      const aiMessage = messages.value.find(m => m.id === aiMessageId);
+      const aiMessage = targetTab.messages.find(m => m.id === aiMessageId);
       if (aiMessage) {
         aiMessage.reasoningContent = reasoningContent;
         // 默认展开显示思考内容
@@ -324,20 +902,36 @@ async function chatMode(userInput: string) {
     if (content) {
       aiContent += content;
       // 实时更新消息内容和 nodes
-      const aiMessage = messages.value.find(m => m.id === aiMessageId);
+      const aiMessage = targetTab.messages.find(m => m.id === aiMessageId);
       if (aiMessage) {
         aiMessage.content = aiContent;
         aiMessage.nodes = parseMarkdownToStructure(aiContent, md);
       }
-      // 流式更新时自动滚动
-      scrollToBottom();
+      // 流式更新时自动滚动（仅当还在当前标签页时）
+      if (activeTabId.value === targetTab.id) {
+        scrollToBottom();
+      }
     }
+  }
+
+  // 保存 AI 回复到会话
+  if (aiContent && targetSession) {
+    // 使用保存的 session 引用
+    await sessionManager.addMessage(targetSession.chat_id, targetSession.mode, {
+      role: 'assistant',
+      content: aiContent
+    });
   }
 }
 
 // Agent模式
-async function agentMode(userInput: string) {
+async function agentMode(userInput: string, attachmentsList: Attachment[] = []) {
   if (!openaiClient) return;
+
+  // 保存当前标签页的引用，防止切换标签页后写入错误的位置
+  const targetTab = currentTab.value;
+  const targetSession = currentSession.value;
+  if (!targetTab) return;
 
   try {
     const summary = await skillsLoader.buildSkillsSummary();
@@ -376,7 +970,7 @@ ${skillsXml}`
     // 创建 AI 消息占位，用于流式更新
     const aiMessageId = Date.now();
     const md = getMarkdown();
-    messages.value.push({
+    targetTab.messages.push({
       id: aiMessageId,
       content: '',
       nodes: [],
@@ -387,8 +981,56 @@ ${skillsXml}`
     // 重置自动滚动标志
     shouldAutoScroll.value = true;
 
+    // 构建消息内容（支持多模态）
+    let messageContent: any = userInput;
+
+    // 如果有附件，构建多模态消息
+    if (attachmentsList.length > 0) {
+      const contentParts: any[] = [{ type: 'input_text', text: userInput }];
+
+      // 添加附件信息到文本
+      const attachmentInfo = attachmentsList.map(att => {
+        if (att.type === 'image') {
+          return `【图片: ${att.name}】`;
+        } else if (att.type === 'text') {
+          return `【文本文件: ${att.name}，路径: ${att.path}】`;
+        } else {
+          return `【文档文件: ${att.name}，路径: ${att.path}】`;
+        }
+      }).join('\n');
+
+      // 更新文本内容
+      contentParts[0].text = `${userInput}\n\n附件文件：\n${attachmentInfo}`;
+
+      // 处理图片附件
+      for (const attachment of attachmentsList) {
+        if (attachment.type === 'image') {
+          try {
+            const base64Data = await readImageAsBase64(attachment.path);
+            const mimeType = attachment.extension === 'png' ? 'image/png' : 'image/jpeg';
+            contentParts.push({
+              type: 'input_image',
+              image: `data:${mimeType};base64,${base64Data}`,
+              detail: 'auto'
+            });
+          } catch (error) {
+            console.error(`读取图片 ${attachment.name} 失败:`, error);
+            contentParts[0].text += `\n[图片 ${attachment.name} 读取失败]`;
+          }
+        }
+      }
+
+      // 使用消息数组格式
+      messageContent = [
+        {
+          role: 'user',
+          content: contentParts
+        }
+      ];
+    }
+
     // 使用流式模式运行 Agent
-    const streamResult = await run(agent, userInput, { stream: true });
+    const streamResult = await run(agent, messageContent, { stream: true });
 
     let aiContent = '';
     // 记录工具调用状态
@@ -400,7 +1042,8 @@ ${skillsXml}`
 
     // 更新消息内容，包含工具调用信息
     function updateMessageContent() {
-      const aiMessage = messages.value.find(m => m.id === aiMessageId);
+      if (!targetTab) return;
+      const aiMessage = targetTab.messages.find(m => m.id === aiMessageId);
       if (!aiMessage) return;
 
       let fullContent = '';
@@ -459,6 +1102,12 @@ ${skillsXml}`
 
     try {
       while (true) {
+        // 检查标签页是否还存在
+        if (!tabs.value.find(t => t.id === targetTab.id)) {
+          // 标签页已被关闭，停止处理
+          break;
+        }
+
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -482,7 +1131,9 @@ ${skillsXml}`
               toolCalls.push({ name: toolName, arguments: toolArgs, status: 'running' });
             }
             updateMessageContent();
-            scrollToBottom();
+            if (activeTabId.value === targetTab.id) {
+              scrollToBottom();
+            }
           }
 
           // 处理工具调用输出
@@ -498,7 +1149,9 @@ ${skillsXml}`
               tool.output = output;
             }
             updateMessageContent();
-            scrollToBottom();
+            if (activeTabId.value === targetTab.id) {
+              scrollToBottom();
+            }
           }
         }
 
@@ -511,8 +1164,10 @@ ${skillsXml}`
             if (textDelta) {
               aiContent += textDelta;
               updateMessageContent();
-              // 流式更新时自动滚动
-              scrollToBottom();
+              // 流式更新时自动滚动（仅当还在当前标签页时）
+              if (activeTabId.value === targetTab.id) {
+                scrollToBottom();
+              }
             }
           }
         }
@@ -524,25 +1179,45 @@ ${skillsXml}`
     // 等待流完成，确保获取最终结果
     await streamResult.completed;
 
-    // 如果内容为空，使用 finalOutput 作为后备
-    const aiMessage = messages.value.find(m => m.id === aiMessageId);
+    // 获取最终的 AI 内容
+    let finalAiContent = aiContent;
+    const aiMessage = targetTab.messages.find(m => m.id === aiMessageId);
     if (aiMessage && (!aiMessage.content || aiMessage.content.trim() === '')) {
       const finalOutput = streamResult.finalOutput;
       if (finalOutput && typeof finalOutput === 'string') {
         aiMessage.content = finalOutput;
         aiMessage.nodes = parseMarkdownToStructure(finalOutput, md);
+        finalAiContent = finalOutput;
       }
     }
-    // 最终滚动到底部
-    scrollToBottom();
+
+    // 保存 AI 回复到会话
+    if (finalAiContent && targetSession) {
+      await sessionManager.addMessage(targetSession.chat_id, targetSession.mode, {
+        role: 'assistant',
+        content: finalAiContent
+      });
+    }
+
+    // 最终滚动到底部（仅当还在当前标签页时）
+    if (activeTabId.value === targetTab.id) {
+      scrollToBottom();
+    }
   } catch (error) {
     console.error('Agent执行失败:', error);
-    messages.value.push({
+    const errorMsg = `Agent执行失败: ${error}`;
+    targetTab.messages.push({
       id: Date.now(),
-      content: `Agent执行失败: ${error}`,
+      content: errorMsg,
       sender: 'ai',
       timestamp: new Date()
     });
+    if (targetSession) {
+      await sessionManager.addMessage(targetSession.chat_id, targetSession.mode, {
+        role: 'assistant',
+        content: errorMsg
+      });
+    }
   }
 }
 
@@ -550,6 +1225,10 @@ ${skillsXml}`
 let unlisten: UnlistenFn | null = null;
 
 onMounted(async () => {
+  // 不初始化默认标签页，从空状态开始
+  tabs.value = [];
+  activeTabId.value = '';
+
   try {
     const config = await invoke<ApiConfig>("get_api_config");
     openaiClient = new OpenAI({
@@ -558,10 +1237,13 @@ onMounted(async () => {
       dangerouslyAllowBrowser: true
     });
     await loadSkills();
+
+    // 加载会话列表
+    await loadConversationList();
   } catch (error) {
     console.error("配置初始化失败:", error);
   }
-  
+
   unlisten = await listen("ai_response", (event) => {
     const response = event.payload as string;
     messages.value.push({
@@ -602,7 +1284,8 @@ function regenerateMessage() {
 
 <template>
   <n-config-provider :theme="lightTheme">
-    <n-layout has-sider class="app-container">
+    <n-message-provider>
+      <n-layout has-sider class="app-container">
       <!-- 左侧边栏 -->
       <n-layout-sider
         bordered
@@ -621,7 +1304,7 @@ function regenerateMessage() {
             <div class="logo-icon">
               <n-icon size="24"><SparklesOutline /></n-icon>
             </div>
-            <span class="logo-text">AI Assistant</span>
+            <span class="logo-text">Nova</span>
           </div>
 
           <!-- 新对话按钮 -->
@@ -670,8 +1353,8 @@ function regenerateMessage() {
             <div class="conversation-list">
               <div
                 v-for="conv in pinnedConversations"
-                :key="conv.id"
-                :class="['conversation-item', { active: currentConversation.id === conv.id }]"
+                :key="conv.chat_id"
+                :class="['conversation-item', { active: currentConversation.chat_id === conv.chat_id }]"
                 @click="selectConversation(conv)"
               >
                 <n-icon><ChatbubbleOutline /></n-icon>
@@ -689,12 +1372,22 @@ function regenerateMessage() {
             <div class="conversation-list">
               <div
                 v-for="conv in todayConversations"
-                :key="conv.id"
-                :class="['conversation-item', { active: currentConversation.id === conv.id }]"
+                :key="conv.chat_id"
+                :class="['conversation-item', { active: currentConversation.chat_id === conv.chat_id }]"
                 @click="selectConversation(conv)"
               >
                 <n-icon><ChatbubbleOutline /></n-icon>
                 <span class="conv-title">{{ conv.title }}</span>
+                <n-button
+                  text
+                  size="tiny"
+                  class="delete-btn"
+                  @click.stop="deleteConversation(conv, $event)"
+                >
+                  <template #icon>
+                    <n-icon><TrashOutline /></n-icon>
+                  </template>
+                </n-button>
               </div>
             </div>
           </div>
@@ -708,12 +1401,22 @@ function regenerateMessage() {
             <div class="conversation-list">
               <div
                 v-for="conv in historyConversations"
-                :key="conv.id"
-                :class="['conversation-item', { active: currentConversation.id === conv.id }]"
+                :key="conv.chat_id"
+                :class="['conversation-item', { active: currentConversation.chat_id === conv.chat_id }]"
                 @click="selectConversation(conv)"
               >
                 <n-icon><ChatbubbleOutline /></n-icon>
                 <span class="conv-title">{{ conv.title }}</span>
+                <n-button
+                  text
+                  size="tiny"
+                  class="delete-btn"
+                  @click.stop="deleteConversation(conv, $event)"
+                >
+                  <template #icon>
+                    <n-icon><TrashOutline /></n-icon>
+                  </template>
+                </n-button>
               </div>
             </div>
           </div>
@@ -733,6 +1436,34 @@ function regenerateMessage() {
 
       <!-- 主内容区 -->
       <n-layout class="main-layout">
+        <!-- 标签页栏（仅在有标签页时显示） -->
+        <div v-if="tabs.length > 0" class="tab-bar">
+          <div class="tab-list">
+            <div
+              v-for="tab in tabs"
+              :key="tab.id"
+              :class="['tab-item', { active: activeTabId === tab.id }]"
+              @click="switchToTab(tab.id)"
+            >
+              <n-icon size="14" class="tab-icon">
+                <ChatbubbleOutline v-if="tab.mode === 'chat'" />
+                <SparklesOutline v-else />
+              </n-icon>
+              <span class="tab-title">{{ tab.title }}</span>
+              <n-button
+                text
+                size="tiny"
+                class="tab-close"
+                @click="closeTab(tab.id, $event)"
+              >
+                <template #icon>
+                  <n-icon size="12"><CloseOutline /></n-icon>
+                </template>
+              </n-button>
+            </div>
+          </div>
+        </div>
+
         <!-- 顶部标题栏 -->
         <n-layout-header bordered class="header">
           <div class="header-content">
@@ -742,7 +1473,7 @@ function regenerateMessage() {
                   <n-icon><MenuOutline /></n-icon>
                 </template>
               </n-button>
-              <span class="conversation-title">{{ currentConversation.title }}</span>
+              <span class="conversation-title">{{ currentTab?.title || '新对话' }}</span>
               <n-button text size="small" class="title-dropdown">
                 <template #icon>
                   <n-icon><ChevronDownOutline /></n-icon>
@@ -788,7 +1519,36 @@ function regenerateMessage() {
 
         <!-- 聊天内容区 -->
         <n-layout-content ref="chatContentRef" class="chat-content" @scroll="handleScroll">
-          <div class="messages-wrapper">
+          <!-- 首页欢迎界面（无标签页时显示） -->
+          <div v-if="tabs.length === 0" class="home-welcome">
+            <div class="welcome-content">
+              <n-icon size="64" color="#2563EB" class="welcome-icon">
+                <SparklesOutline />
+              </n-icon>
+              <h1 class="welcome-title">欢迎使用 Nova</h1>
+              <p class="welcome-subtitle">选择模式后，直接在下方输入内容开始对话</p>
+              <div class="welcome-modes">
+                <div
+                  :class="['mode-card', { active: currentMode === 'chat' }]"
+                  @click="switchMode('chat')"
+                >
+                  <n-icon size="24" color="#2563EB"><ChatbubbleOutline /></n-icon>
+                  <span>Chat 模式</span>
+                  <p>智能对话，深度思考</p>
+                </div>
+                <div
+                  :class="['mode-card', { active: currentMode === 'agent' }]"
+                  @click="switchMode('agent')"
+                >
+                  <n-icon size="24" color="#2563EB"><SparklesOutline /></n-icon>
+                  <span>Agent 模式</span>
+                  <p>工具调用，文件处理</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="messages-wrapper">
             <div
               v-for="message in messages"
               :key="message.id"
@@ -818,7 +1578,7 @@ function regenerateMessage() {
               <!-- 消息内容 -->
               <div class="message-body">
                 <div class="message-header">
-                  <span class="sender-name">{{ message.sender === 'user' ? '用户' : 'AI Assistant' }}</span>
+                  <span class="sender-name">{{ message.sender === 'user' ? '用户' : 'Nova' }}</span>
                   <span class="message-time">{{ message.timestamp.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</span>
                 </div>
                 <div class="message-text">
@@ -917,6 +1677,33 @@ function regenerateMessage() {
         <n-layout-footer bordered class="footer">
           <div class="input-wrapper-outer">
             <div class="input-container">
+              <!-- 附件列表 -->
+              <div v-if="attachments.length > 0" class="attachments-list">
+                <div
+                  v-for="attachment in attachments"
+                  :key="attachment.id"
+                  class="attachment-item"
+                >
+                  <n-icon size="16" class="attachment-icon">
+                    <component :is="getFileIcon(attachment.type)" />
+                  </n-icon>
+                  <div class="attachment-info">
+                    <span class="attachment-name" :title="attachment.name">{{ attachment.name }}</span>
+                    <span class="attachment-type">{{ getTypeLabel(attachment.type, attachment.extension) }}</span>
+                  </div>
+                  <n-button
+                    text
+                    size="tiny"
+                    class="attachment-remove"
+                    @click="removeAttachment(attachment.id)"
+                  >
+                    <template #icon>
+                      <n-icon size="14"><CloseOutline /></n-icon>
+                    </template>
+                  </n-button>
+                </div>
+              </div>
+
               <n-space vertical>
                  <!-- 文本输入区域 -->
                 <n-input
@@ -929,43 +1716,24 @@ function regenerateMessage() {
                   class="message-input"
                 />
               </n-space>
-             
+
               <!-- 底部工具栏 -->
               <div class="input-toolbar">
                 <div class="toolbar-left">
-                  <n-tooltip trigger="hover">
+                  <!-- 添加附件（仅 Agent 模式） -->
+                  <n-tooltip v-if="(currentTab?.mode || currentMode) === 'agent'" trigger="hover">
                     <template #trigger>
-                      <n-button text size="small" class="tool-btn">
+                      <n-button text size="small" class="tool-btn" @click="openAttachmentDialog">
                         <template #icon>
                           <n-icon size="18"><LinkOutlined /></n-icon>
                         </template>
                       </n-button>
                     </template>
-                    添加链接
+                    添加附件 ({{ attachments.length }}/{{ MAX_ATTACHMENTS }})
                   </n-tooltip>
-                  <n-tooltip trigger="hover">
-                    <template #trigger>
-                      <n-button text size="small" class="tool-btn">
-                        <template #icon>
-                          <n-icon size="18"><ImageOutline /></n-icon>
-                        </template>
-                      </n-button>
-                    </template>
-                    添加图片
-                  </n-tooltip>
-                  <n-tooltip trigger="hover">
-                    <template #trigger>
-                      <n-button text size="small" class="tool-btn">
-                        <template #icon>
-                          <n-icon size="18"><MicOutline /></n-icon>
-                        </template>
-                      </n-button>
-                    </template>
-                    语音输入
-                  </n-tooltip>
-                  <n-divider vertical style="height: 16px; margin: 0 4px;" />
+                  <n-divider v-if="(currentTab?.mode || currentMode) === 'chat'" vertical style="height: 16px; margin: 0 4px;" />
                   <!-- 深度思考开关（仅 Chat 模式） -->
-                  <n-tooltip v-if="currentMode === 'chat'" trigger="hover">
+                  <n-tooltip v-if="(currentTab?.mode || currentMode) === 'chat'" trigger="hover">
                     <template #trigger>
                       <n-button
                         text
@@ -980,10 +1748,10 @@ function regenerateMessage() {
                     </template>
                     {{ enableThinking ? '已开启深度思考' : '点击开启深度思考' }}
                   </n-tooltip>
-                  <n-divider v-if="currentMode === 'chat'" vertical style="height: 16px; margin: 0 4px;" />
+                  <n-divider v-if="(currentTab?.mode || currentMode) === 'chat'" vertical style="height: 16px; margin: 0 4px;" />
                   <div class="model-selector-inline">
                     <n-icon size="14" color="#2563EB"><SparklesOutline /></n-icon>
-                    <span>LongCat-Flash-Chat</span>
+                    <span>{{ (currentTab?.mode || currentMode) === 'chat' ? 'LongCat-Flash-Chat' : 'Agent Mode' }}</span>
                     <n-icon size="12"><ChevronDownOutline /></n-icon>
                   </div>
                 </div>
@@ -1005,12 +1773,13 @@ function regenerateMessage() {
         </n-layout-footer>
       </n-layout>
     </n-layout>
+    </n-message-provider>
   </n-config-provider>
 </template>
 
 <style scoped>
 /* ============================================
-   AI Assistant - Modern Glassmorphism Design
+   Nova - Modern Glassmorphism Design
    ============================================ */
 
 /* CSS Variables - Design Tokens */
@@ -1214,12 +1983,18 @@ function regenerateMessage() {
   color: #475569;
   transition: all var(--transition-fast);
   background: transparent;
+  position: relative;
 }
 
 .conversation-item:hover {
   background: rgba(255, 255, 255, 0.8);
   color: #1E293B;
   transform: translateX(2px);
+}
+
+.conversation-item:hover .delete-btn {
+  opacity: 1;
+  visibility: visible;
 }
 
 .conversation-item.active {
@@ -1248,6 +2023,21 @@ function regenerateMessage() {
   white-space: nowrap;
 }
 
+.delete-btn {
+  opacity: 0;
+  visibility: hidden;
+  transition: all var(--transition-fast);
+  color: #94a3b8;
+  padding: 2px;
+  margin: -2px;
+}
+
+.delete-btn:hover {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 4px;
+}
+
 .sidebar-footer {
   margin-top: auto;
 }
@@ -1274,6 +2064,96 @@ function regenerateMessage() {
 .main-layout {
   background: #FFFFFF;
   position: relative;
+}
+
+/* 标签页栏样式 */
+.tab-bar {
+  background: #F8FAFC;
+  border-bottom: 1px solid #E2E8F0;
+  padding: 8px 16px 0;
+  flex-shrink: 0;
+}
+
+.tab-list {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tab-list::-webkit-scrollbar {
+  display: none;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  cursor: pointer;
+  font-size: 13px;
+  color: #64748B;
+  transition: all var(--transition-fast);
+  min-width: 120px;
+  max-width: 200px;
+  position: relative;
+}
+
+.tab-item:hover {
+  background: #F1F5F9;
+  color: #475569;
+}
+
+.tab-item.active {
+  background: #FFFFFF;
+  color: #1E293B;
+  border-color: #CBD5E1;
+  border-bottom: 2px solid #2563EB;
+  font-weight: 500;
+}
+
+.tab-icon {
+  flex-shrink: 0;
+}
+
+.tab-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  opacity: 0;
+  color: #94A3B8 !important;
+  padding: 2px !important;
+  margin: -2px;
+  transition: all var(--transition-fast);
+}
+
+.tab-item:hover .tab-close {
+  opacity: 1;
+}
+
+.tab-close:hover {
+  color: #EF4444 !important;
+  background: rgba(239, 68, 68, 0.1) !important;
+}
+
+.tab-add {
+  color: #64748B !important;
+  padding: 6px !important;
+  margin-left: 4px;
+}
+
+.tab-add:hover {
+  color: #2563EB !important;
+  background: rgba(37, 99, 235, 0.1) !important;
 }
 
 /* 头部样式 */
@@ -1354,6 +2234,79 @@ function regenerateMessage() {
   margin: 0 auto;
   padding: 24px 32px;
   user-select: none;
+}
+
+/* 首页欢迎界面 */
+.home-welcome {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 48px;
+}
+
+.welcome-content {
+  text-align: center;
+  max-width: 480px;
+}
+
+.welcome-icon {
+  margin-bottom: 24px;
+}
+
+.welcome-title {
+  font-size: 28px;
+  font-weight: 600;
+  color: #1E293B;
+  margin-bottom: 12px;
+}
+
+.welcome-subtitle {
+  font-size: 16px;
+  color: #64748B;
+  margin-bottom: 32px;
+}
+
+.welcome-modes {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+}
+
+.mode-card {
+  flex: 1;
+  max-width: 180px;
+  padding: 20px 16px;
+  background: #F8FAFC;
+  border: 2px solid #E2E8F0;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  text-align: center;
+}
+
+.mode-card:hover {
+  background: #F1F5F9;
+  border-color: #CBD5E1;
+}
+
+.mode-card.active {
+  background: #EFF6FF;
+  border-color: #2563EB;
+}
+
+.mode-card span {
+  display: block;
+  margin-top: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #1E293B;
+}
+
+.mode-card p {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #94A3B8;
 }
 
 /* 回到底部按钮 */
@@ -1713,6 +2666,73 @@ function regenerateMessage() {
   border-color: #CBD5E1;
 }
 
+/* 附件列表样式 */
+.attachments-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #E2E8F0;
+}
+
+.attachment-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  font-size: 13px;
+  transition: all var(--transition-fast);
+}
+
+.attachment-item:hover {
+  background: #F1F5F9;
+  border-color: #CBD5E1;
+}
+
+.attachment-icon {
+  color: #64748B;
+  flex-shrink: 0;
+}
+
+.attachment-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.attachment-name {
+  color: #1E293B;
+  font-weight: 500;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-type {
+  font-size: 11px;
+  color: #94A3B8;
+  font-weight: 400;
+}
+
+.attachment-remove {
+  color: #94A3B8 !important;
+  flex-shrink: 0;
+  padding: 2px;
+  border-radius: 4px;
+  transition: all var(--transition-fast);
+}
+
+.attachment-remove:hover {
+  color: #EF4444 !important;
+  background: rgba(239, 68, 68, 0.1);
+}
+
 /* 输入框去除边框 */
 .message-input :deep(.n-input__border),
 .message-input :deep(.n-input__state-border) {
@@ -1738,6 +2758,21 @@ function regenerateMessage() {
   display: flex;
   align-items: center;
   gap: 2px;
+}
+
+/* 修复 n-upload 组件间距问题 */
+.toolbar-left :deep(.n-upload) {
+  display: inline-flex;
+  width: auto !important;
+}
+
+.toolbar-left :deep(.n-upload .n-upload-trigger) {
+  display: inline-flex;
+  width: auto !important;
+}
+
+.toolbar-left :deep(.n-upload .n-button) {
+  margin: 0 !important;
 }
 
 .toolbar-right {

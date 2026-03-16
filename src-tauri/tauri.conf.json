@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "my-ai-assistant",
+  "productName": "Nova",
   "version": "0.1.0",
   "identifier": "com.wangwenbo.my-ai-assistant",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "AI Assistant",
+        "title": "Nova",
         "width": 800,
         "height": 600
       }

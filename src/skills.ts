@@ -35,14 +35,14 @@ export interface SkillsSummary {
  * Skills 配置
  */
 export interface SkillsConfig {
-  // 用户目录下的 skills (~/.longcat/skills)
+  // 用户目录下的 skills (~/.nova/skills)
   userSkillsDir: string;
   // 内置 skills 目录
   builtinSkillsDir?: string;
 }
 
 const DEFAULT_CONFIG: SkillsConfig = {
-  userSkillsDir: ".longcat/skills",
+  userSkillsDir: ".nova/skills",
   builtinSkillsDir: "./skills"
 };
 
