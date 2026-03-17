@@ -6,7 +6,7 @@ import OpenAI from "openai";
 import { Agent, run, setDefaultOpenAIKey, OpenAIChatCompletionsModel, type RunStreamEvent } from "@openai/agents";
 import { skillsLoader } from "./skills";
 import { agentTools } from "./tools";
-import { sessionManager, type Session, type SessionMessage } from "./sessionManager";
+import { sessionManager, type Session } from "./sessionManager";
 import MarkdownRender, { getMarkdown, parseMarkdownToStructure, type ParsedNode } from 'markstream-vue'
 import {
   NLayout,
@@ -23,7 +23,13 @@ import {
   NConfigProvider,
   NMessageProvider,
   lightTheme,
-  createDiscreteApi
+  createDiscreteApi,
+  NTag,
+  NSelect,
+  NModal,
+  NForm,
+  NFormItem,
+  NInputGroup
 } from 'naive-ui'
 import {
   ChatbubbleOutline,
@@ -60,6 +66,22 @@ interface Attachment {
   content?: string; // 文本文件内容
 }
 
+// 渠道配置类型
+interface Channel {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key: string;
+  models: string[];
+}
+
+// 应用配置类型
+interface AppConfig {
+  channels: Channel[];
+  chat_channel_id: string;
+  agent_channel_id: string;
+}
+
 // 最大附件数量
 const MAX_ATTACHMENTS = 5;
 
@@ -94,6 +116,7 @@ interface Tab {
   session: Session | null;       // 关联的会话对象
   attachments: Attachment[];     // 附件列表（仅Agent模式）
   isLoading?: boolean;           // 是否正在加载
+  selectedModel?: string;        // 该标签页选择的模型
   created_at: number;
   updated_at: number;
 }
@@ -107,13 +130,6 @@ interface Conversation {
   updated_at: number;
   message_count: number;
   pinned?: boolean;
-}
-
-// 配置类型
-interface ApiConfig {
-  base_url: string;
-  model: string;
-  token: string;
 }
 
 // Skill类型
@@ -133,6 +149,27 @@ const isLoading = ref(false);
 const currentMode = ref<ChatMode>('chat');
 const skills = ref<SkillInfo[]>([]);
 const collapsed = ref(false);
+
+// 设置面板状态
+const showSettings = ref(false);
+const appConfig = ref<AppConfig>({
+  channels: [],
+  chat_channel_id: '',
+  agent_channel_id: ''
+});
+const editingChannel = ref<Channel | null>(null);
+const isAddingChannel = ref(false);
+const newModelInput = ref('');
+
+// 控制渠道编辑弹窗显示
+const showChannelModal = computed({
+  get: () => editingChannel.value !== null,
+  set: (value: boolean) => {
+    if (!value) {
+      editingChannel.value = null;
+    }
+  }
+});
 
 // 标签页状态管理
 const tabs = ref<Tab[]>([]);
@@ -193,6 +230,47 @@ const currentConversation = ref<Conversation>({
 
 // 深度思考开关（仅 Chat 模式）
 const enableThinking = ref(false);
+
+// 首页默认选择的模型（用于没有标签页时）
+const defaultSelectedModel = ref('');
+
+// 当前选中的模型 - 改为计算属性，从当前标签页获取/设置
+const selectedModel = computed({
+  get: () => {
+    const tab = currentTab.value;
+    if (tab?.selectedModel) {
+      return tab.selectedModel;
+    }
+    // 首页时使用默认选择的模型
+    if (!tab && defaultSelectedModel.value) {
+      return defaultSelectedModel.value;
+    }
+    // 如果没有设置，返回默认模型
+    const mode = tab?.mode || 'chat';
+    const channel = appConfig.value.channels.find(
+      c => c.id === (mode === 'chat' ? appConfig.value.chat_channel_id : appConfig.value.agent_channel_id)
+    );
+    return channel?.models?.[0] || '';
+  },
+  set: (value: string) => {
+    const tab = currentTab.value;
+    if (tab) {
+      tab.selectedModel = value;
+    } else {
+      // 首页时保存到默认变量
+      defaultSelectedModel.value = value;
+    }
+  }
+});
+
+// 获取当前可用模型列表
+const availableModels = computed(() => {
+  const mode = currentTab.value?.mode || 'chat';
+  const channel = appConfig.value.channels.find(
+    c => c.id === (mode === 'chat' ? appConfig.value.chat_channel_id : appConfig.value.agent_channel_id)
+  );
+  return channel?.models || [];
+});
 
 // 消息提示 - 使用 createDiscreteApi 在 setup 外部使用 message
 const { message } = createDiscreteApi(['message']);
@@ -312,6 +390,7 @@ async function createTab(mode: 'chat' | 'agent' = 'chat', title?: string) {
     ],
     session: null,
     attachments: [],
+    selectedModel: defaultSelectedModel.value || undefined,
     created_at: Date.now(),
     updated_at: Date.now()
   };
@@ -334,6 +413,123 @@ async function createTab(mode: 'chat' | 'agent' = 'chat', title?: string) {
   return newTab;
 }
 
+// ========== 设置面板函数 ==========
+
+// 打开设置面板
+async function openSettings() {
+  showSettings.value = true;
+  await loadAppConfig();
+}
+
+// 加载应用配置
+async function loadAppConfig() {
+  try {
+    const config = await invoke<AppConfig>('get_api_config');
+    appConfig.value = config;
+  } catch (error) {
+    console.error('加载配置失败:', error);
+    message.error('加载配置失败');
+  }
+}
+
+// 保存应用配置
+async function saveAppConfig() {
+  try {
+    await invoke('save_api_config', { config: appConfig.value });
+    message.success('配置已保存');
+    // 重新初始化 OpenAI 客户端
+    const defaultChannel = appConfig.value.channels[0];
+    if (defaultChannel) {
+      openaiClient = new OpenAI({
+        baseURL: defaultChannel.base_url,
+        apiKey: defaultChannel.api_key,
+        dangerouslyAllowBrowser: true
+      });
+    }
+  } catch (error) {
+    console.error('保存配置失败:', error);
+    message.error('保存配置失败');
+  }
+}
+
+// 添加新渠道
+function addChannel() {
+  editingChannel.value = {
+    id: `channel_${Date.now()}`,
+    name: '新渠道',
+    base_url: 'https://api.openai.com/v1',
+    api_key: '',
+    models: ['gpt-3.5-turbo']
+  };
+  isAddingChannel.value = true;
+}
+
+// 编辑渠道
+function editChannel(channel: Channel) {
+  editingChannel.value = { ...channel };
+  isAddingChannel.value = false;
+}
+
+// 保存渠道
+function saveChannel() {
+  if (!editingChannel.value) return;
+  
+  const index = appConfig.value.channels.findIndex(c => c.id === editingChannel.value!.id);
+  if (index > -1) {
+    // 更新现有渠道
+    appConfig.value.channels[index] = { ...editingChannel.value };
+  } else {
+    // 添加新渠道
+    appConfig.value.channels.push({ ...editingChannel.value });
+  }
+  
+  // 如果是第一个渠道，设置为默认
+  if (appConfig.value.channels.length === 1) {
+    appConfig.value.chat_channel_id = editingChannel.value.id;
+    appConfig.value.agent_channel_id = editingChannel.value.id;
+  }
+  
+  editingChannel.value = null;
+  saveAppConfig();
+}
+
+// 删除渠道
+function deleteChannel(channelId: string) {
+  const index = appConfig.value.channels.findIndex(c => c.id === channelId);
+  if (index > -1) {
+    appConfig.value.channels.splice(index, 1);
+    // 如果删除的是当前选中的渠道，重置选择
+    if (appConfig.value.chat_channel_id === channelId) {
+      appConfig.value.chat_channel_id = appConfig.value.channels[0]?.id || '';
+    }
+    if (appConfig.value.agent_channel_id === channelId) {
+      appConfig.value.agent_channel_id = appConfig.value.channels[0]?.id || '';
+    }
+    saveAppConfig();
+  }
+}
+
+// 添加模型到渠道
+function addModelToChannel() {
+  if (!editingChannel.value || !newModelInput.value.trim()) return;
+  if (!editingChannel.value.models.includes(newModelInput.value.trim())) {
+    editingChannel.value.models.push(newModelInput.value.trim());
+  }
+  newModelInput.value = '';
+}
+
+// 从渠道删除模型
+function removeModelFromChannel(modelIndex: number) {
+  if (!editingChannel.value) return;
+  editingChannel.value.models.splice(modelIndex, 1);
+}
+
+// 关闭设置面板
+function closeSettings() {
+  showSettings.value = false;
+  editingChannel.value = null;
+}
+
 // 切换到指定标签页
 function switchToTab(tabId: string) {
   if (activeTabId.value === tabId) return;
@@ -343,6 +539,7 @@ function switchToTab(tabId: string) {
     currentMode.value = tab.mode;
     currentSession.value = tab.session;
     // messages 和 attachments 是计算属性，会自动同步
+    // selectedModel 也是计算属性，会自动从 tab.selectedModel 获取
   }
 }
 
@@ -392,6 +589,7 @@ function switchMode(mode: ChatMode) {
 
 // 新建对话（创建新标签页，使用当前选择的模式）
 async function createNewConversation() {
+  showSettings.value = false; // 关闭设置面板
   await createTab(currentMode.value);
   loadConversationList();
 }
@@ -419,6 +617,9 @@ async function loadConversationList() {
 
 // 选择对话
 async function selectConversation(conv: Conversation) {
+  // 关闭设置面板
+  showSettings.value = false;
+
   // 检查是否已经有标签页打开了这个会话
   const existingTab = tabs.value.find(t => t.chat_id === conv.chat_id);
 
@@ -475,61 +676,6 @@ async function selectConversation(conv: Conversation) {
   activeTabId.value = newTab.id;
   currentSession.value = session;
   currentMode.value = session.mode;
-}
-
-// 保存消息到当前会话
-async function saveMessageToSession(role: 'user' | 'assistant' | 'tool', content: string, extra?: any) {
-  if (!currentSession.value) return;
-
-  const message: Omit<SessionMessage, 'id' | 'timestamp'> = {
-    role,
-    content,
-    ...extra
-  };
-
-  await sessionManager.addMessage(currentSession.value.chat_id, currentSession.value.mode, message);
-
-  // 更新当前会话
-  currentSession.value = await sessionManager.loadSession(currentSession.value.chat_id, currentSession.value.mode);
-
-  // 更新会话列表中的消息计数
-  const conv = conversations.value.find(c => c.chat_id === currentSession.value?.chat_id);
-  if (conv) {
-    conv.message_count = currentSession.value?.messages.length || 0;
-    conv.updated_at = Date.now();
-  }
-}
-
-// 生成会话标题（从用户输入截取前15个字符）
-function generateSessionTitle(userInput: string): string {
-  const maxLength = 15;
-  if (userInput.length <= maxLength) {
-    return userInput;
-  }
-  return userInput.slice(0, maxLength) + '...';
-}
-
-// 更新会话标题（如果是第一条用户消息）
-async function updateSessionTitleIfNeeded(userInput: string) {
-  if (!currentSession.value) return;
-
-  // 检查是否只有系统消息和这一条用户消息（即第一条用户消息）
-  const userMessages = currentSession.value.messages.filter(m => m.role === 'user');
-  if (userMessages.length === 1 && currentSession.value.title === '新对话') {
-    const newTitle = generateSessionTitle(userInput);
-    await sessionManager.updateSessionTitle(
-      currentSession.value.chat_id,
-      currentSession.value.mode,
-      newTitle
-    );
-
-    // 更新当前会话和会话列表
-    currentSession.value.title = newTitle;
-    const conv = conversations.value.find(c => c.chat_id === currentSession.value?.chat_id);
-    if (conv) {
-      conv.title = newTitle;
-    }
-  }
 }
 
 // 删除会话
@@ -684,11 +830,6 @@ function removeAttachment(id: string) {
   if (index > -1) {
     attachments.value.splice(index, 1);
   }
-}
-
-// 清空所有附件
-function clearAttachments() {
-  attachments.value = [];
 }
 
 // 读取图片为 base64
@@ -846,14 +987,14 @@ async function chatMode(userInput: string) {
   // 添加当前用户消息
   messagesContext.push({ role: 'user', content: userInput });
 
-  // 构建请求参数
-  const requestParams: any = {
-    model: 'qwen3.5-plus',
-    messages: messagesContext,
-    stream: true,
-    enable_thinking: enableThinking.value,
-    max_tokens: 8192  // 设置最大输出 token 数
-  };
+    // 构建请求参数
+    const requestParams: any = {
+      model: selectedModel.value || 'qwen3.5-plus',
+      messages: messagesContext,
+      stream: true,
+      enable_thinking: enableThinking.value,
+      max_tokens: 8192  // 设置最大输出 token 数
+    };
 
   const stream = await openaiClient.chat.completions.create(requestParams) as any;
 
@@ -944,8 +1085,8 @@ Skills with available="false" need dependencies installed first.
 ${skillsXml}`
       : '';
 
-    setDefaultOpenAIKey(openaiClient.apiKey);
-    const model = new OpenAIChatCompletionsModel(openaiClient, 'qwen3.5-plus');
+      setDefaultOpenAIKey(openaiClient.apiKey);
+      const model = new OpenAIChatCompletionsModel(openaiClient, selectedModel.value || 'qwen3.5-plus');
     const agent = new Agent({
       name: 'Assistant',
       instructions: `你是一个智能助手，可以帮助用户完成各种任务。
@@ -1230,12 +1371,18 @@ onMounted(async () => {
   activeTabId.value = '';
 
   try {
-    const config = await invoke<ApiConfig>("get_api_config");
-    openaiClient = new OpenAI({
-      baseURL: config.base_url,
-      apiKey: config.token,
-      dangerouslyAllowBrowser: true
-    });
+    const config = await invoke<AppConfig>("get_api_config");
+    // 保存配置到响应式变量
+    appConfig.value = config;
+    // 获取默认渠道的配置
+    const defaultChannel = config.channels[0];
+    if (defaultChannel) {
+      openaiClient = new OpenAI({
+        baseURL: defaultChannel.base_url,
+        apiKey: defaultChannel.api_key,
+        dangerouslyAllowBrowser: true
+      });
+    }
     await loadSkills();
 
     // 加载会话列表
@@ -1424,7 +1571,7 @@ function regenerateMessage() {
           <!-- 底部设置 -->
           <div class="sidebar-footer">
             <n-divider style="margin: 12px 0;" />
-            <n-button text class="settings-btn">
+            <n-button text class="settings-btn" @click="openSettings">
               <template #icon>
                 <n-icon><SettingsOutline /></n-icon>
               </template>
@@ -1436,133 +1583,276 @@ function regenerateMessage() {
 
       <!-- 主内容区 -->
       <n-layout class="main-layout">
-        <!-- 标签页栏（仅在有标签页时显示） -->
-        <div v-if="tabs.length > 0" class="tab-bar">
-          <div class="tab-list">
-            <div
-              v-for="tab in tabs"
-              :key="tab.id"
-              :class="['tab-item', { active: activeTabId === tab.id }]"
-              @click="switchToTab(tab.id)"
-            >
-              <n-icon size="14" class="tab-icon">
-                <ChatbubbleOutline v-if="tab.mode === 'chat'" />
-                <SparklesOutline v-else />
-              </n-icon>
-              <span class="tab-title">{{ tab.title }}</span>
-              <n-button
-                text
-                size="tiny"
-                class="tab-close"
-                @click="closeTab(tab.id, $event)"
+        <!-- 设置页面（替换整个内容区） -->
+        <template v-if="showSettings">
+          <n-layout-content class="settings-page">
+            <div class="settings-wrapper">
+              <!-- 页面头部 -->
+              <div class="settings-header">
+                <n-button text @click="closeSettings" class="back-btn">
+                  <template #icon>
+                    <n-icon size="18"><ChevronDownOutline style="transform: rotate(90deg)" /></n-icon>
+                  </template>
+                  返回对话
+                </n-button>
+                <div class="header-info">
+                  <h1>设置</h1>
+                  <p>管理您的 AI 供应商和模型配置</p>
+                </div>
+              </div>
+
+              <div class="settings-body">
+                <!-- 渠道管理卡片 -->
+                <div class="settings-card">
+                  <div class="card-header">
+                    <div class="card-title">
+                      <div class="title-icon">
+                        <n-icon size="20"><SparklesOutline /></n-icon>
+                      </div>
+                      <div>
+                        <h3>渠道管理</h3>
+                        <p>配置 AI 供应商连接信息</p>
+                      </div>
+                    </div>
+                    <n-button type="primary" @click="addChannel" class="add-channel-btn">
+                      <template #icon>
+                        <n-icon><AddOutline /></n-icon>
+                      </template>
+                      添加渠道
+                    </n-button>
+                  </div>
+
+                  <!-- 渠道列表 -->
+                  <div class="channel-list">
+                    <div
+                      v-for="channel in appConfig.channels"
+                      :key="channel.id"
+                      class="channel-card"
+                    >
+                      <div class="channel-main">
+                        <div class="channel-icon">
+                          <n-icon size="24"><SparklesOutline /></n-icon>
+                        </div>
+                        <div class="channel-details">
+                          <div class="channel-name">{{ channel.name }}</div>
+                          <div class="channel-url">{{ channel.base_url }}</div>
+                          <div class="channel-models">
+                            <span
+                              v-for="(model, idx) in channel.models.slice(0, 3)"
+                              :key="idx"
+                              class="model-chip"
+                            >
+                              {{ model }}
+                            </span>
+                            <span v-if="channel.models.length > 3" class="model-chip more">
+                              +{{ channel.models.length - 3 }}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                      <div class="channel-actions">
+                        <n-button quaternary size="small" @click="editChannel(channel)">
+                          <template #icon>
+                            <n-icon><SettingsOutline /></n-icon>
+                          </template>
+                        </n-button>
+                        <n-button quaternary size="small" type="error" @click="deleteChannel(channel.id)">
+                          <template #icon>
+                            <n-icon><TrashOutline /></n-icon>
+                          </template>
+                        </n-button>
+                      </div>
+                    </div>
+
+                    <div v-if="appConfig.channels.length === 0" class="empty-state">
+                      <div class="empty-icon">
+                        <n-icon size="48" color="#CBD5E1"><SparklesOutline /></n-icon>
+                      </div>
+                      <p>暂无渠道配置</p>
+                      <span>点击上方按钮添加您的第一个 AI 供应商</span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 默认渠道卡片 -->
+                <div class="settings-card">
+                  <div class="card-header">
+                    <div class="card-title">
+                      <div class="title-icon green">
+                        <n-icon size="20"><ChatbubbleOutline /></n-icon>
+                      </div>
+                      <div>
+                        <h3>默认渠道</h3>
+                        <p>为不同模式设置默认使用的渠道</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="default-settings">
+                    <div class="setting-item">
+                      <div class="setting-info">
+                        <span class="setting-label">Chat 模式</span>
+                        <span class="setting-desc">智能对话、深度思考</span>
+                      </div>
+                      <n-select
+                        v-model:value="appConfig.chat_channel_id"
+                        :options="appConfig.channels.map(c => ({ label: c.name, value: c.id }))"
+                        placeholder="选择渠道"
+                        class="model-select"
+                        style="width: 200px"
+                        @update:value="saveAppConfig"
+                      />
+                    </div>
+                    <div class="setting-item">
+                      <div class="setting-info">
+                        <span class="setting-label">Agent 模式</span>
+                        <span class="setting-desc">工具调用、文件处理</span>
+                      </div>
+                      <n-select
+                        v-model:value="appConfig.agent_channel_id"
+                        :options="appConfig.channels.map(c => ({ label: c.name, value: c.id }))"
+                        placeholder="选择渠道"
+                        class="model-select"
+                        style="width: 200px"
+                        @update:value="saveAppConfig"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </n-layout-content>
+        </template>
+
+        <!-- 聊天页面 -->
+        <template v-else>
+          <!-- 标签页栏（仅在有标签页时显示） -->
+          <div v-if="tabs.length > 0" class="tab-bar">
+            <div class="tab-list">
+              <div
+                v-for="tab in tabs"
+                :key="tab.id"
+                :class="['tab-item', { active: activeTabId === tab.id }]"
+                @click="switchToTab(tab.id)"
               >
-                <template #icon>
-                  <n-icon size="12"><CloseOutline /></n-icon>
-                </template>
-              </n-button>
-            </div>
-          </div>
-        </div>
-
-        <!-- 顶部标题栏 -->
-        <n-layout-header bordered class="header">
-          <div class="header-content">
-            <div class="header-left">
-              <n-button v-if="collapsed" text @click="collapsed = false" class="menu-toggle">
-                <template #icon>
-                  <n-icon><MenuOutline /></n-icon>
-                </template>
-              </n-button>
-              <span class="conversation-title">{{ currentTab?.title || '新对话' }}</span>
-              <n-button text size="small" class="title-dropdown">
-                <template #icon>
-                  <n-icon><ChevronDownOutline /></n-icon>
-                </template>
-              </n-button>
-            </div>
-            <div class="header-right">
-              <n-space :size="4">
-                <n-tooltip trigger="hover">
-                  <template #trigger>
-                    <n-button text>
-                      <template #icon>
-                        <n-icon><SearchOutline /></n-icon>
-                      </template>
-                    </n-button>
-                  </template>
-                  搜索对话
-                </n-tooltip>
-                <n-tooltip trigger="hover">
-                  <template #trigger>
-                    <n-button text>
-                      <template #icon>
-                        <n-icon><CopyOutline /></n-icon>
-                      </template>
-                    </n-button>
-                  </template>
-                  复制对话
-                </n-tooltip>
-                <n-tooltip trigger="hover">
-                  <template #trigger>
-                    <n-button text>
-                      <template #icon>
-                        <n-icon><TrashOutline /></n-icon>
-                      </template>
-                    </n-button>
-                  </template>
-                  删除对话
-                </n-tooltip>
-              </n-space>
-            </div>
-          </div>
-        </n-layout-header>
-
-        <!-- 聊天内容区 -->
-        <n-layout-content ref="chatContentRef" class="chat-content" @scroll="handleScroll">
-          <!-- 首页欢迎界面（无标签页时显示） -->
-          <div v-if="tabs.length === 0" class="home-welcome">
-            <div class="welcome-content">
-              <n-icon size="64" color="#2563EB" class="welcome-icon">
-                <SparklesOutline />
-              </n-icon>
-              <h1 class="welcome-title">欢迎使用 Nova</h1>
-              <p class="welcome-subtitle">选择模式后，直接在下方输入内容开始对话</p>
-              <div class="welcome-modes">
-                <div
-                  :class="['mode-card', { active: currentMode === 'chat' }]"
-                  @click="switchMode('chat')"
+                <n-icon size="14" class="tab-icon">
+                  <ChatbubbleOutline v-if="tab.mode === 'chat'" />
+                  <SparklesOutline v-else />
+                </n-icon>
+                <span class="tab-title">{{ tab.title }}</span>
+                <n-button
+                  text
+                  size="tiny"
+                  class="tab-close"
+                  @click="closeTab(tab.id, $event)"
                 >
-                  <n-icon size="24" color="#2563EB"><ChatbubbleOutline /></n-icon>
-                  <span>Chat 模式</span>
-                  <p>智能对话，深度思考</p>
-                </div>
-                <div
-                  :class="['mode-card', { active: currentMode === 'agent' }]"
-                  @click="switchMode('agent')"
-                >
-                  <n-icon size="24" color="#2563EB"><SparklesOutline /></n-icon>
-                  <span>Agent 模式</span>
-                  <p>工具调用，文件处理</p>
-                </div>
+                  <template #icon>
+                    <n-icon size="12"><CloseOutline /></n-icon>
+                  </template>
+                </n-button>
               </div>
             </div>
           </div>
 
-          <div v-else class="messages-wrapper">
-            <div
-              v-for="message in messages"
-              :key="message.id"
-              :class="['message-row', message.sender]"
-            >
-              <!-- 用户头像 -->
-              <n-avatar
-                v-if="message.sender === 'user'"
-                round
-                :size="36"
-                class="avatar user-avatar"
-                :style="{ background: 'linear-gradient(135deg, #6366F1 0%, #8B5CF6 100%)' }"
+          <!-- 顶部标题栏 -->
+          <n-layout-header bordered class="header">
+            <div class="header-content">
+              <div class="header-left">
+                <n-button v-if="collapsed" text @click="collapsed = false" class="menu-toggle">
+                  <template #icon>
+                    <n-icon><MenuOutline /></n-icon>
+                  </template>
+                </n-button>
+                <span class="conversation-title">{{ currentTab?.title || '新对话' }}</span>
+                <n-button text size="small" class="title-dropdown">
+                  <template #icon>
+                    <n-icon><ChevronDownOutline /></n-icon>
+                  </template>
+                </n-button>
+              </div>
+              <div class="header-right">
+                <n-space :size="4">
+                  <n-tooltip trigger="hover">
+                    <template #trigger>
+                      <n-button text>
+                        <template #icon>
+                          <n-icon><SearchOutline /></n-icon>
+                        </template>
+                      </n-button>
+                    </template>
+                    搜索对话
+                  </n-tooltip>
+                  <n-tooltip trigger="hover">
+                    <template #trigger>
+                      <n-button text>
+                        <template #icon>
+                          <n-icon><CopyOutline /></n-icon>
+                        </template>
+                      </n-button>
+                    </template>
+                    复制对话
+                  </n-tooltip>
+                  <n-tooltip trigger="hover">
+                    <template #trigger>
+                      <n-button text>
+                        <template #icon>
+                          <n-icon><TrashOutline /></n-icon>
+                        </template>
+                      </n-button>
+                    </template>
+                    删除对话
+                  </n-tooltip>
+                </n-space>
+              </div>
+            </div>
+          </n-layout-header>
+
+          <!-- 聊天内容区 -->
+          <n-layout-content ref="chatContentRef" class="chat-content" @scroll="handleScroll">
+            <!-- 首页欢迎界面（无标签页时显示） -->
+            <div v-if="tabs.length === 0" class="home-welcome">
+              <div class="welcome-content">
+                <n-icon size="64" color="#2563EB" class="welcome-icon">
+                  <SparklesOutline />
+                </n-icon>
+                <h1 class="welcome-title">欢迎使用 Nova</h1>
+                <p class="welcome-subtitle">选择模式后，直接在下方输入内容开始对话</p>
+                <div class="welcome-modes">
+                  <div
+                    :class="['mode-card', { active: currentMode === 'chat' }]"
+                    @click="switchMode('chat')"
+                  >
+                    <n-icon size="24" color="#2563EB"><ChatbubbleOutline /></n-icon>
+                    <span>Chat 模式</span>
+                    <p>智能对话，深度思考</p>
+                  </div>
+                  <div
+                    :class="['mode-card', { active: currentMode === 'agent' }]"
+                    @click="switchMode('agent')"
+                  >
+                    <n-icon size="24" color="#2563EB"><SparklesOutline /></n-icon>
+                    <span>Agent 模式</span>
+                    <p>工具调用，文件处理</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-else class="messages-wrapper">
+              <div
+                v-for="message in messages"
+                :key="message.id"
+                :class="['message-row', message.sender]"
               >
-                U
+                <!-- 用户头像 -->
+                <n-avatar
+                  v-if="message.sender === 'user'"
+                  round
+                  :size="36"
+                  class="avatar user-avatar"
+                  :style="{ background: 'linear-gradient(135deg, #6366F1 0%, #8B5CF6 100%)' }"
+                >
+                  U
               </n-avatar>
 
               <!-- AI头像 -->
@@ -1748,12 +2038,17 @@ function regenerateMessage() {
                     </template>
                     {{ enableThinking ? '已开启深度思考' : '点击开启深度思考' }}
                   </n-tooltip>
-                  <n-divider v-if="(currentTab?.mode || currentMode) === 'chat'" vertical style="height: 16px; margin: 0 4px;" />
-                  <div class="model-selector-inline">
-                    <n-icon size="14" color="#2563EB"><SparklesOutline /></n-icon>
-                    <span>{{ (currentTab?.mode || currentMode) === 'chat' ? 'LongCat-Flash-Chat' : 'Agent Mode' }}</span>
-                    <n-icon size="12"><ChevronDownOutline /></n-icon>
-                  </div>
+                  <n-divider vertical style="height: 16px; margin: 0 4px;" />
+                  <!-- 模型选择下拉框 -->
+                  <n-select
+                    v-model:value="selectedModel"
+                    :options="availableModels.map(m => ({ label: m, value: m }))"
+                    size="small"
+                    class="model-select"
+                    style="width: 180px"
+                    placeholder="选择模型"
+                    :disabled="availableModels.length === 0"
+                  />
                 </div>
                 <div class="toolbar-right">
                   <n-button
@@ -1771,7 +2066,63 @@ function regenerateMessage() {
             </div>
           </div>
         </n-layout-footer>
+        </template>
       </n-layout>
+
+      <!-- 渠道编辑弹窗 -->
+      <n-modal
+        v-model:show="showChannelModal"
+        :title="isAddingChannel ? '添加渠道' : '编辑渠道'"
+        preset="card"
+        style="width: 500px"
+        :mask-closable="false"
+      >
+        <div v-if="editingChannel" class="channel-form">
+          <n-form label-placement="left" label-width="100">
+            <n-form-item label="渠道名称">
+              <n-input v-model:value="editingChannel.name" placeholder="例如：OpenAI" />
+            </n-form-item>
+            <n-form-item label="Base URL">
+              <n-input v-model:value="editingChannel.base_url" placeholder="https://api.openai.com/v1" />
+            </n-form-item>
+            <n-form-item label="API Key">
+              <n-input
+                v-model:value="editingChannel.api_key"
+                type="password"
+                placeholder="sk-..."
+                show-password-on="click"
+              />
+            </n-form-item>
+            <n-form-item label="模型列表">
+              <div class="models-input">
+                <n-tag
+                  v-for="(model, index) in editingChannel.models"
+                  :key="index"
+                  closable
+                  @close="removeModelFromChannel(index)"
+                  class="model-tag"
+                >
+                  {{ model }}
+                </n-tag>
+                <n-input-group>
+                  <n-input
+                    v-model:value="newModelInput"
+                    placeholder="输入模型名称"
+                    @keyup.enter="addModelToChannel"
+                  />
+                  <n-button @click="addModelToChannel">添加</n-button>
+                </n-input-group>
+              </div>
+            </n-form-item>
+          </n-form>
+        </div>
+        <template #footer>
+          <n-space justify="end">
+            <n-button @click="editingChannel = null">取消</n-button>
+            <n-button type="primary" @click="saveChannel">保存</n-button>
+          </n-space>
+        </template>
+      </n-modal>
     </n-layout>
     </n-message-provider>
   </n-config-provider>
@@ -1819,6 +2170,272 @@ function regenerateMessage() {
 .app-container {
   height: 100vh;
   font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* ============================================
+   设置面板样式
+   ============================================ */
+.settings-page {
+  height: 100%;
+  overflow-y: auto;
+  background: linear-gradient(180deg, #F8FAFC 0%, #F1F5F9 100%);
+}
+
+.settings-wrapper {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.settings-header {
+  margin-bottom: 24px;
+}
+
+.settings-header .back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #64748B;
+  font-size: 14px;
+  padding: 8px 12px;
+  margin-left: -12px;
+  border-radius: 8px;
+  transition: all 0.2s;
+}
+
+.settings-header .back-btn:hover {
+  background: #F1F5F9;
+  color: #2563EB;
+}
+
+.settings-header .header-info {
+  margin-top: 16px;
+}
+
+.settings-header .header-info h1 {
+  font-size: 24px;
+  font-weight: 700;
+  color: #0F172A;
+  margin-bottom: 4px;
+}
+
+.settings-header .header-info p {
+  font-size: 14px;
+  color: #64748B;
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.settings-card {
+  background: #FFFFFF;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 20px;
+}
+
+.card-title {
+  display: flex;
+  gap: 12px;
+}
+
+.title-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #EEF2FF 0%, #E0E7FF 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #4F46E5;
+}
+
+.title-icon.green {
+  background: linear-gradient(135deg, #ECFDF5 0%, #D1FAE5 100%);
+  color: #059669;
+}
+
+.card-title h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #0F172A;
+  margin-bottom: 2px;
+}
+
+.card-title p {
+  font-size: 13px;
+  color: #64748B;
+}
+
+.add-channel-btn {
+  border-radius: 8px;
+}
+
+.channel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.channel-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  background: #FAFBFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 12px;
+  transition: all 0.2s;
+}
+
+.channel-card:hover {
+  border-color: #CBD5E1;
+  background: #FFFFFF;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.channel-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+}
+
+.channel-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #EEF2FF 0%, #E0E7FF 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #4F46E5;
+}
+
+.channel-details {
+  flex: 1;
+}
+
+.channel-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: #0F172A;
+  margin-bottom: 2px;
+}
+
+.channel-url {
+  font-size: 12px;
+  color: #94A3B8;
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  margin-bottom: 8px;
+}
+
+.channel-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.model-chip {
+  display: inline-flex;
+  padding: 2px 8px;
+  background: #F1F5F9;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #475569;
+  font-weight: 500;
+}
+
+.model-chip.more {
+  background: #EEF2FF;
+  color: #4F46E5;
+}
+
+.channel-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  border: 2px dashed #E2E8F0;
+  border-radius: 12px;
+  background: #FAFBFC;
+}
+
+.empty-state .empty-icon {
+  margin-bottom: 12px;
+}
+
+.empty-state p {
+  font-size: 15px;
+  font-weight: 500;
+  color: #475569;
+  margin-bottom: 4px;
+}
+
+.empty-state span {
+  font-size: 13px;
+  color: #94A3B8;
+}
+
+.default-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.setting-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  background: #FAFBFC;
+  border-radius: 10px;
+}
+
+.setting-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.setting-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #0F172A;
+}
+
+.setting-desc {
+  font-size: 12px;
+  color: #94A3B8;
+}
+
+.channel-form {
+  padding: 16px 0;
+}
+
+.models-input {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.models-input .model-tag {
+  margin-right: 8px;
+  margin-bottom: 8px;
 }
 
 /* ============================================
@@ -2808,6 +3425,46 @@ function regenerateMessage() {
 
 .model-selector-inline:hover {
   background: #F3F4F6;
+}
+
+/* 模型选择器样式 */
+.model-select {
+  --n-border: none !important;
+  --n-border-hover: none !important;
+  --n-border-focus: none !important;
+  --n-border-active: none !important;
+  --n-box-shadow-focus: none !important;
+}
+
+.model-select :deep(.n-base-selection) {
+  background-color: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.model-select :deep(.n-base-selection__border),
+.model-select :deep(.n-base-selection__state-border) {
+  border: none !important;
+}
+
+.model-select :deep(.n-base-selection:hover) {
+  background-color: transparent !important;
+}
+
+.model-select :deep(.n-base-selection--active),
+.model-select :deep(.n-base-selection--focused) {
+  background-color: transparent !important;
+  box-shadow: none !important;
+  border: none !important;
+}
+
+.model-select :deep(.n-base-selection-input) {
+  background-color: transparent !important;
+}
+
+.model-select :deep(.n-base-selection-label) {
+  background-color: transparent !important;
 }
 
 /* 发送按钮 */

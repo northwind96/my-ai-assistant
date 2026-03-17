@@ -65,14 +65,6 @@ class SessionManager {
     this.initialized = true;
   }
 
-  private async ensureDirExists(dirPath: string): Promise<void> {
-    try {
-      await invoke('create_dir_all', { path: dirPath });
-    } catch (error) {
-      console.error('Failed to create directory:', error);
-    }
-  }
-
   // 根据 mode 获取会话目录
   private getSessionsDir(mode: 'chat' | 'agent'): string {
     return `${this.baseSessionsDir}/${mode}`;

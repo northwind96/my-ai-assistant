@@ -4,13 +4,30 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
 // 配置结构
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ApiConfig {
-    api: ApiSettings,
+    channels: Vec<Channel>,
+    chat_channel_id: String,
+    agent_channel_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct ApiSettings {
+struct Channel {
+    id: String,
+    name: String,
+    base_url: String,
+    api_key: String,
+    models: Vec<String>,
+}
+
+// 向后兼容的旧配置格式
+#[derive(Debug, Deserialize, Clone)]
+struct OldApiConfig {
+    api: OldApiSettings,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct OldApiSettings {
     base_url: String,
     model: String,
     token: String,
@@ -19,7 +36,7 @@ struct ApiSettings {
 // 全局配置
 static CONFIG: Lazy<Mutex<Option<ApiConfig>>> = Lazy::new(|| Mutex::new(None));
 
-// 从用户本地目录加载配置
+// 从用户本地目录加载配置（支持旧格式迁移）
 fn load_config() -> Result<ApiConfig, Box<dyn std::error::Error>> {
     // 获取用户主目录
     let home_dir = std::env::var("HOME").map_err(|_| "无法获取用户主目录")?;
@@ -32,8 +49,26 @@ fn load_config() -> Result<ApiConfig, Box<dyn std::error::Error>> {
     println!("配置文件路径: {:?}", config_path);
 
     let config_content = std::fs::read_to_string(&config_path)?;
-    let config: ApiConfig = serde_json::from_str(&config_content)?;
-    Ok(config)
+    
+    // 尝试解析新格式
+    if let Ok(config) = serde_json::from_str::<ApiConfig>(&config_content) {
+        return Ok(config);
+    }
+    
+    // 如果失败，尝试解析旧格式并转换
+    let old_config: OldApiConfig = serde_json::from_str(&config_content)?;
+    let new_config = ApiConfig {
+        channels: vec![Channel {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            base_url: old_config.api.base_url,
+            api_key: old_config.api.token,
+            models: vec![old_config.api.model],
+        }],
+        chat_channel_id: "default".to_string(),
+        agent_channel_id: "default".to_string(),
+    };
+    Ok(new_config)
 }
 
 // 启动时加载并初始化配置
@@ -141,17 +176,40 @@ fn init_config() -> Result<String, String> {
     let config = load_config().map_err(|e| e.to_string())?;
     let mut global_config = CONFIG.lock().map_err(|e| e.to_string())?;
     *global_config = Some(config.clone());
-    Ok(format!("配置加载成功，模型: {}", config.api.model))
+    let models = config.channels.iter().map(|c| &c.name).collect::<Vec<_>>();
+    Ok(format!("配置加载成功，渠道: {:?}", models))
 }
 
 // 获取API配置命令（供前端使用）
 #[tauri::command]
-fn get_api_config() -> Result<ApiSettings, String> {
+fn get_api_config() -> Result<ApiConfig, String> {
     let config_guard = CONFIG.lock().map_err(|e| e.to_string())?;
     let config = config_guard
         .as_ref()
         .ok_or("配置未初始化，请先调用 init_config")?;
-    Ok(config.api.clone())
+    Ok(config.clone())
+}
+
+#[tauri::command]
+async fn save_api_config(config: ApiConfig) -> Result<(), String> {
+    let home_dir = std::env::var("HOME").map_err(|_| "无法获取用户主目录".to_string())?;
+    let config_path = std::path::Path::new(&home_dir)
+        .join(".nova")
+        .join("setting.json");
+
+    // 确保目录存在
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let config_json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, config_json).map_err(|e| e.to_string())?;
+
+    // 更新全局配置
+    let mut config_guard = CONFIG.lock().map_err(|e| e.to_string())?;
+    *config_guard = Some(config);
+
+    Ok(())
 }
 
 // AI处理请求命令
@@ -165,10 +223,17 @@ async fn process_ai_request(app: AppHandle, prompt: String) -> Result<(), String
         let config = config_guard
             .as_ref()
             .ok_or("配置未初始化，请先调用 init_config")?;
+        
+        // 获取默认渠道
+        let channel = config.channels.first()
+            .ok_or("未配置任何渠道")?;
+        let model_name = channel.models.first()
+            .ok_or("未配置任何模型")?;
+        
         (
-            config.api.base_url.clone(),
-            config.api.model.clone(),
-            config.api.token.clone(),
+            channel.base_url.clone(),
+            model_name.clone(),
+            channel.api_key.clone(),
         )
     };
 
@@ -384,6 +449,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             init_config,
             get_api_config,
+            save_api_config,
             get_skills,
             process_ai_request,
             exec_command,
