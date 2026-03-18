@@ -439,6 +439,115 @@ fn read_file_as_base64(path: String) -> Result<String, String> {
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes))
 }
 
+// 环境检查结果
+#[derive(Debug, Serialize, Deserialize)]
+struct EnvCheckResult {
+    python3: bool,
+    node: bool,
+    python3_version: Option<String>,
+    node_version: Option<String>,
+}
+
+// 检查环境命令
+#[tauri::command]
+fn check_environment() -> Result<EnvCheckResult, String> {
+    use std::process::Command;
+
+    // 检查 Python3
+    let python3_check = Command::new("python3")
+        .arg("--version")
+        .output();
+
+    let (python3, python3_version) = match python3_check {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_string();
+            (true, Some(version))
+        }
+        _ => (false, None),
+    };
+
+    // 检查 Node
+    let node_check = Command::new("node")
+        .arg("--version")
+        .output();
+
+    let (node, node_version) = match node_check {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_string();
+            (true, Some(version))
+        }
+        _ => (false, None),
+    };
+
+    Ok(EnvCheckResult {
+        python3,
+        node,
+        python3_version,
+        node_version,
+    })
+}
+
+// 初始化状态
+#[derive(Debug, Serialize, Deserialize)]
+struct InitStatus {
+    initialized: bool,
+    env_checked: bool,
+    config_completed: bool,
+}
+
+// 获取初始化状态
+#[tauri::command]
+fn get_init_status() -> Result<InitStatus, String> {
+    let home_dir = std::env::var("HOME").map_err(|_| "无法获取用户主目录")?;
+    let init_flag_path = std::path::Path::new(&home_dir)
+        .join(".nova")
+        .join(".initialized");
+
+    let initialized = init_flag_path.exists();
+
+    // 检查配置是否完成
+    let config_path = std::path::Path::new(&home_dir)
+        .join(".nova")
+        .join("setting.json");
+
+    let config_completed = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => {
+                match serde_json::from_str::<ApiConfig>(&content) {
+                    Ok(config) => !config.channels.is_empty(),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    Ok(InitStatus {
+        initialized,
+        env_checked: initialized,
+        config_completed,
+    })
+}
+
+// 标记初始化完成
+#[tauri::command]
+fn mark_initialized() -> Result<(), String> {
+    let home_dir = std::env::var("HOME").map_err(|_| "无法获取用户主目录")?;
+    let nova_dir = std::path::Path::new(&home_dir).join(".nova");
+    let init_flag_path = nova_dir.join(".initialized");
+
+    std::fs::write(&init_flag_path, "")
+        .map_err(|e| format!("写入初始化标志失败: {}", e))?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -461,7 +570,10 @@ pub fn run() {
             write_text_file,
             remove_file,
             read_dir,
-            read_file_as_base64
+            read_file_as_base64,
+            check_environment,
+            get_init_status,
+            mark_initialized
         ])
         .setup(|_app| {
             // 应用启动时自动初始化配置

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, computed, watch, nextTick, h } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import OpenAI from "openai";
@@ -49,10 +49,19 @@ import {
   BulbOutline,
   DocumentTextOutline,
   ImageOutline,
-  CloseOutline
+  CloseOutline,
+  ServerOutline,
+  KeyOutline,
+  LinkOutline,
+  CubeOutline,
+  LayersOutline,
+  BuildOutline,
+  CloudOutline,
+  BusinessOutline
 } from '@vicons/ionicons5'
 
 import {LinkOutlined} from '@vicons/antd'
+import OnboardingWizard from './components/OnboardingWizard.vue'
 
 // 附件类型定义
 interface Attachment {
@@ -160,6 +169,10 @@ const appConfig = ref<AppConfig>({
 const editingChannel = ref<Channel | null>(null);
 const isAddingChannel = ref(false);
 const newModelInput = ref('');
+
+// 初始化引导状态
+const showOnboarding = ref(false);
+const isInitializing = ref(true);
 
 // 控制渠道编辑弹窗显示
 const showChannelModal = computed({
@@ -271,6 +284,59 @@ const availableModels = computed(() => {
   );
   return channel?.models || [];
 });
+
+// 获取模型对应的图标路径（本地 SVG 图标）
+function getModelIcon(modelName: string): string {
+  const name = modelName.toLowerCase();
+  // 本地图标路径（放在 public/icons/ 目录下）
+  if (name.includes('longcat')) {
+    return '/icons/longcat-color.svg';
+  } else if (name.includes('chatgpt') || name.includes('gpt')) {
+    return '/icons/openai.svg';
+  } else if (name.includes('qwen')) {
+    return '/icons/qwen-color.svg';
+  } else if (name.includes('gemini')) {
+    return '/icons/gemini-color.svg';
+  } else if (name.includes('claude')) {
+    return '/icons/claude-color.svg';
+  }
+  // 默认使用 OpenAI logo
+  return '/icons/openai.svg';
+}
+
+// 模型选项（带图标）
+const modelOptions = computed(() => {
+  return availableModels.value.map(m => ({
+    label: m,
+    value: m,
+    icon: getModelIcon(m)
+  }));
+});
+
+// 渲染模型标签（选择框中显示）
+function renderModelLabel(option: any) {
+  return h('span', { style: 'display: inline-flex; align-items: center;' }, [
+    h('img', {
+      src: option.icon,
+      style: 'width: 16px; height: 16px; margin-right: 6px; border-radius: 2px; vertical-align: middle;'
+    }),
+    h('span', { style: 'vertical-align: middle;' }, option.label)
+  ]);
+}
+
+// 渲染模型选项（下拉列表中显示）
+function renderModelOption(props: any) {
+  const { option } = props;
+  return h('span', {
+    style: 'display: inline-flex; align-items: center;'
+  }, [
+    h('img', {
+      src: option.icon,
+      style: 'width: 18px; height: 18px; margin-right: 8px; border-radius: 2px; vertical-align: middle;'
+    }),
+    h('span', { style: 'vertical-align: middle;' }, option.label)
+  ]);
+}
 
 // 消息提示 - 使用 createDiscreteApi 在 setup 外部使用 message
 const { message } = createDiscreteApi(['message']);
@@ -1371,6 +1437,17 @@ onMounted(async () => {
   activeTabId.value = '';
 
   try {
+    // 检查初始化状态
+    const initStatus = await invoke<{ initialized: boolean; config_completed: boolean }>('get_init_status');
+
+    if (!initStatus.initialized || !initStatus.config_completed) {
+      // 需要显示初始化引导
+      showOnboarding.value = true;
+      isInitializing.value = false;
+      return;
+    }
+
+    // 已初始化，继续加载配置
     const config = await invoke<AppConfig>("get_api_config");
     // 保存配置到响应式变量
     appConfig.value = config;
@@ -1391,6 +1468,8 @@ onMounted(async () => {
     console.error("配置初始化失败:", error);
   }
 
+  isInitializing.value = false;
+
   unlisten = await listen("ai_response", (event) => {
     const response = event.payload as string;
     messages.value.push({
@@ -1401,6 +1480,29 @@ onMounted(async () => {
     });
   });
 });
+
+// 初始化完成回调
+async function onOnboardingComplete() {
+  showOnboarding.value = false;
+
+  // 重新加载配置
+  try {
+    const config = await invoke<AppConfig>("get_api_config");
+    appConfig.value = config;
+    const defaultChannel = config.channels[0];
+    if (defaultChannel) {
+      openaiClient = new OpenAI({
+        baseURL: defaultChannel.base_url,
+        apiKey: defaultChannel.api_key,
+        dangerouslyAllowBrowser: true
+      });
+    }
+    await loadSkills();
+    await loadConversationList();
+  } catch (error) {
+    console.error("配置加载失败:", error);
+  }
+}
 
 onUnmounted(() => {
   if (unlisten) unlisten();
@@ -1430,7 +1532,17 @@ function regenerateMessage() {
 </script>
 
 <template>
-  <n-config-provider :theme="lightTheme">
+  <!-- 初始化引导 -->
+  <OnboardingWizard v-if="showOnboarding" @complete="onOnboardingComplete" />
+
+  <!-- 加载中 -->
+  <div v-else-if="isInitializing" class="app-loading">
+    <div class="loading-spinner"></div>
+    <p>正在启动...</p>
+  </div>
+
+  <!-- 主应用 -->
+  <n-config-provider v-else :theme="lightTheme">
     <n-message-provider>
       <n-layout has-sider class="app-container">
       <!-- 左侧边栏 -->
@@ -1606,8 +1718,8 @@ function regenerateMessage() {
                 <div class="settings-card">
                   <div class="card-header">
                     <div class="card-title">
-                      <div class="title-icon">
-                        <n-icon size="20"><SparklesOutline /></n-icon>
+                      <div class="title-icon purple">
+                        <n-icon size="20"><ServerOutline /></n-icon>
                       </div>
                       <div>
                         <h3>渠道管理</h3>
@@ -1625,23 +1737,27 @@ function regenerateMessage() {
                   <!-- 渠道列表 -->
                   <div class="channel-list">
                     <div
-                      v-for="channel in appConfig.channels"
+                      v-for="(channel, index) in appConfig.channels"
                       :key="channel.id"
                       class="channel-card"
                     >
                       <div class="channel-main">
-                        <div class="channel-icon">
-                          <n-icon size="24"><SparklesOutline /></n-icon>
+                        <div class="channel-icon" :class="'color-' + (index % 5)">
+                          <n-icon size="24"><CloudOutline /></n-icon>
                         </div>
                         <div class="channel-details">
                           <div class="channel-name">{{ channel.name }}</div>
-                          <div class="channel-url">{{ channel.base_url }}</div>
+                          <div class="channel-url">
+                            <n-icon size="12" style="margin-right: 4px;"><LinkOutline /></n-icon>
+                            {{ channel.base_url }}
+                          </div>
                           <div class="channel-models">
                             <span
                               v-for="(model, idx) in channel.models.slice(0, 3)"
                               :key="idx"
                               class="model-chip"
                             >
+                              <n-icon size="10" style="margin-right: 2px;"><CubeOutline /></n-icon>
                               {{ model }}
                             </span>
                             <span v-if="channel.models.length > 3" class="model-chip more">
@@ -1653,7 +1769,7 @@ function regenerateMessage() {
                       <div class="channel-actions">
                         <n-button quaternary size="small" @click="editChannel(channel)">
                           <template #icon>
-                            <n-icon><SettingsOutline /></n-icon>
+                            <n-icon><BuildOutline /></n-icon>
                           </template>
                         </n-button>
                         <n-button quaternary size="small" type="error" @click="deleteChannel(channel.id)">
@@ -1666,7 +1782,7 @@ function regenerateMessage() {
 
                     <div v-if="appConfig.channels.length === 0" class="empty-state">
                       <div class="empty-icon">
-                        <n-icon size="48" color="#CBD5E1"><SparklesOutline /></n-icon>
+                        <n-icon size="48" color="#CBD5E1"><ServerOutline /></n-icon>
                       </div>
                       <p>暂无渠道配置</p>
                       <span>点击上方按钮添加您的第一个 AI 供应商</span>
@@ -2040,15 +2156,23 @@ function regenerateMessage() {
                   </n-tooltip>
                   <n-divider vertical style="height: 16px; margin: 0 4px;" />
                   <!-- 模型选择下拉框 -->
-                  <n-select
-                    v-model:value="selectedModel"
-                    :options="availableModels.map(m => ({ label: m, value: m }))"
-                    size="small"
-                    class="model-select"
-                    style="width: 180px"
-                    placeholder="选择模型"
-                    :disabled="availableModels.length === 0"
-                  />
+                  <div class="model-select-wrapper">
+                    <img
+                      v-if="selectedModel"
+                      :src="getModelIcon(selectedModel)"
+                      class="model-select-icon"
+                      alt="model"
+                    />
+                    <n-select
+                      v-model:value="selectedModel"
+                      :options="availableModels.map(m => ({ label: m, value: m }))"
+                      size="small"
+                      class="model-select-with-icon"
+                      style="width: 150px"
+                      placeholder="选择模型"
+                      :disabled="availableModels.length === 0"
+                    />
+                  </div>
                 </div>
                 <div class="toolbar-right">
                   <n-button
@@ -2132,6 +2256,43 @@ function regenerateMessage() {
 /* ============================================
    Nova - Modern Glassmorphism Design
    ============================================ */
+
+/* 应用加载状态 */
+.app-loading {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  z-index: 10000;
+}
+
+.app-loading p {
+  color: white;
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.loading-spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 
 /* CSS Variables - Design Tokens */
 :root {
@@ -2319,6 +2480,38 @@ function regenerateMessage() {
   display: flex;
   align-items: center;
   justify-content: center;
+  color: #4F46E5;
+}
+
+/* 多种颜色的渠道图标 */
+.channel-icon.color-0 {
+  background: linear-gradient(135deg, #EEF2FF 0%, #E0E7FF 100%);
+  color: #4F46E5;
+}
+
+.channel-icon.color-1 {
+  background: linear-gradient(135deg, #F0FDF4 0%, #DCFCE7 100%);
+  color: #16A34A;
+}
+
+.channel-icon.color-2 {
+  background: linear-gradient(135deg, #FEF3C7 0%, #FDE68A 100%);
+  color: #D97706;
+}
+
+.channel-icon.color-3 {
+  background: linear-gradient(135deg, #FCE7F3 0%, #FBCFE8 100%);
+  color: #DB2777;
+}
+
+.channel-icon.color-4 {
+  background: linear-gradient(135deg, #E0F2FE 0%, #BAE6FD 100%);
+  color: #0284C7;
+}
+
+/* 标题图标颜色 */
+.title-icon.purple {
+  background: linear-gradient(135deg, #EEF2FF 0%, #E0E7FF 100%);
   color: #4F46E5;
 }
 
@@ -3465,6 +3658,48 @@ function regenerateMessage() {
 
 .model-select :deep(.n-base-selection-label) {
   background-color: transparent !important;
+}
+
+/* 模型选择器带图标的样式 */
+.model-select-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #F3F4F6;
+  border-radius: 6px;
+  padding: 0 8px;
+}
+
+.model-select-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.model-select-with-icon {
+  --n-border: none !important;
+  --n-border-hover: none !important;
+  --n-border-focus: none !important;
+  --n-border-active: none !important;
+  --n-box-shadow-focus: none !important;
+  background: transparent !important;
+}
+
+.model-select-with-icon :deep(.n-base-selection) {
+  background-color: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+.model-select-with-icon :deep(.n-base-selection:hover) {
+  background-color: transparent !important;
+}
+
+.model-select-with-icon :deep(.n-base-selection--active),
+.model-select-with-icon :deep(.n-base-selection--focused) {
+  background-color: transparent !important;
+  box-shadow: none !important;
 }
 
 /* 发送按钮 */
