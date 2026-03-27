@@ -36,9 +36,6 @@ import {
   SparklesOutline,
   AddOutline,
   SettingsOutline,
-  CopyOutline,
-  RefreshOutline,
-  TrashOutline,
   PaperPlaneOutline,
   MenuOutline,
   ChevronDownOutline,
@@ -51,13 +48,11 @@ import {
   ImageOutline,
   CloseOutline,
   ServerOutline,
-  KeyOutline,
   LinkOutline,
   CubeOutline,
-  LayersOutline,
   BuildOutline,
   CloudOutline,
-  BusinessOutline
+  TrashOutline
 } from '@vicons/ionicons5'
 
 import {LinkOutlined} from '@vicons/antd'
@@ -304,37 +299,18 @@ function getModelIcon(modelName: string): string {
   return '/icons/openai.svg';
 }
 
-// 模型选项（带图标）
-const modelOptions = computed(() => {
-  return availableModels.value.map(m => ({
-    label: m,
-    value: m,
-    icon: getModelIcon(m)
-  }));
-});
-
-// 渲染模型标签（选择框中显示）
-function renderModelLabel(option: any) {
-  return h('span', { style: 'display: inline-flex; align-items: center;' }, [
-    h('img', {
-      src: option.icon,
-      style: 'width: 16px; height: 16px; margin-right: 6px; border-radius: 2px; vertical-align: middle;'
-    }),
-    h('span', { style: 'vertical-align: middle;' }, option.label)
-  ]);
-}
-
-// 渲染模型选项（下拉列表中显示）
-function renderModelOption(props: any) {
-  const { option } = props;
-  return h('span', {
-    style: 'display: inline-flex; align-items: center;'
+// 渲染模型选项标签（图标+名称）
+function renderModelLabel(option: { label: string; value: string }) {
+  return h('div', {
+    style: 'display: inline-flex; align-items: center; gap: 10px; padding: 0 8px;'
   }, [
     h('img', {
-      src: option.icon,
-      style: 'width: 18px; height: 18px; margin-right: 8px; border-radius: 2px; vertical-align: middle;'
+      src: getModelIcon(option.value),
+      style: 'width: 16px; height: 16px; border-radius: 3px; flex-shrink: 0;'
     }),
-    h('span', { style: 'vertical-align: middle;' }, option.label)
+    h('span', {
+      style: 'font-weight: 500; color: #374151;'
+    }, option.label)
   ]);
 }
 
@@ -1188,8 +1164,29 @@ ${skillsXml}`
     // 重置自动滚动标志
     shouldAutoScroll.value = true;
 
-    // 构建消息内容（支持多模态）
-    let messageContent: any = userInput;
+    // 构建消息内容（支持多模态和历史上下文）
+    let messageContent: any;
+
+    // 构建历史消息上下文 - 从 targetTab.messages 获取
+    const messagesContext: Array<{ role: string; content: any }> = [];
+
+    // 使用标签页的消息构建历史上下文
+    if (targetTab.messages.length > 0) {
+      // 过滤掉空的 AI 消息（正在流式生成的占位消息）
+      const validMessages = targetTab.messages.filter(m => {
+        if (m.sender === 'ai' && (!m.content || m.content === '')) {
+          return false;
+        }
+        return true;
+      });
+
+      validMessages.forEach(m => {
+        messagesContext.push({
+          role: m.sender === 'user' ? 'user' : 'assistant',
+          content: m.content || ''
+        });
+      });
+    }
 
     // 如果有附件，构建多模态消息
     if (attachmentsList.length > 0) {
@@ -1227,13 +1224,19 @@ ${skillsXml}`
         }
       }
 
-      // 使用消息数组格式
-      messageContent = [
-        {
-          role: 'user',
-          content: contentParts
-        }
-      ];
+      // 使用消息数组格式，包含历史上下文
+      messagesContext.push({
+        role: 'user',
+        content: contentParts
+      });
+      messageContent = messagesContext;
+    } else {
+      // 没有附件，添加当前用户消息到上下文
+      messagesContext.push({
+        role: 'user',
+        content: userInput
+      });
+      messageContent = messagesContext.length === 1 ? userInput : messagesContext;
     }
 
     // 使用流式模式运行 Agent
@@ -1520,15 +1523,6 @@ function handleKeyPress(event: KeyboardEvent) {
   }
 }
 
-// 复制消息
-function copyMessage(content: string) {
-  navigator.clipboard.writeText(content);
-}
-
-// 重新生成
-function regenerateMessage() {
-  // 重新生成最后一条AI消息
-}
 </script>
 
 <template>
@@ -2029,39 +2023,6 @@ function regenerateMessage() {
                   </div>
                 </div>
 
-                <!-- AI消息操作按钮 -->
-                <div v-if="message.sender === 'ai'" class="message-actions">
-                  <n-tooltip trigger="hover">
-                    <template #trigger>
-                      <n-button text size="tiny" @click="copyMessage(message.content)">
-                        <template #icon>
-                          <n-icon><CopyOutline /></n-icon>
-                        </template>
-                      </n-button>
-                    </template>
-                    复制
-                  </n-tooltip>
-                  <n-tooltip trigger="hover">
-                    <template #trigger>
-                      <n-button text size="tiny" @click="regenerateMessage">
-                        <template #icon>
-                          <n-icon><RefreshOutline /></n-icon>
-                        </template>
-                      </n-button>
-                    </template>
-                    重新生成
-                  </n-tooltip>
-                  <n-tooltip trigger="hover">
-                    <template #trigger>
-                      <n-button text size="tiny">
-                        <template #icon>
-                          <n-icon><TrashOutline /></n-icon>
-                        </template>
-                      </n-button>
-                    </template>
-                    删除
-                  </n-tooltip>
-                </div>
               </div>
             </div>
 
@@ -2156,23 +2117,16 @@ function regenerateMessage() {
                   </n-tooltip>
                   <n-divider vertical style="height: 16px; margin: 0 4px;" />
                   <!-- 模型选择下拉框 -->
-                  <div class="model-select-wrapper">
-                    <img
-                      v-if="selectedModel"
-                      :src="getModelIcon(selectedModel)"
-                      class="model-select-icon"
-                      alt="model"
-                    />
-                    <n-select
-                      v-model:value="selectedModel"
-                      :options="availableModels.map(m => ({ label: m, value: m }))"
-                      size="small"
-                      class="model-select-with-icon"
-                      style="width: 150px"
-                      placeholder="选择模型"
-                      :disabled="availableModels.length === 0"
-                    />
-                  </div>
+                  <n-select
+                    v-model:value="selectedModel"
+                    :options="availableModels.map(m => ({ label: m, value: m }))"
+                    :render-label="renderModelLabel"
+                    size="small"
+                    class="model-select-integrated"
+                    style="width: 220px"
+                    placeholder="选择模型"
+                    :disabled="availableModels.length === 0"
+                  />
                 </div>
                 <div class="toolbar-right">
                   <n-button
@@ -3660,46 +3614,63 @@ function regenerateMessage() {
   background-color: transparent !important;
 }
 
-/* 模型选择器带图标的样式 */
-.model-select-wrapper {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  background: #F3F4F6;
-  border-radius: 6px;
-  padding: 0 8px;
-}
-
-.model-select-icon {
-  width: 16px;
-  height: 16px;
-  border-radius: 2px;
-  flex-shrink: 0;
-}
-
-.model-select-with-icon {
+/* 模型选择器样式 */
+.model-select-integrated {
   --n-border: none !important;
   --n-border-hover: none !important;
   --n-border-focus: none !important;
   --n-border-active: none !important;
   --n-box-shadow-focus: none !important;
-  background: transparent !important;
+  --n-text-color: #374151 !important;
 }
 
-.model-select-with-icon :deep(.n-base-selection) {
+.model-select-integrated :deep(.n-base-selection) {
   background-color: transparent !important;
   border: none !important;
   box-shadow: none !important;
 }
 
-.model-select-with-icon :deep(.n-base-selection:hover) {
-  background-color: transparent !important;
+.model-select-integrated :deep(.n-base-selection__border),
+.model-select-integrated :deep(.n-base-selection__state-border) {
+  border: none !important;
+  display: none !important;
 }
 
-.model-select-with-icon :deep(.n-base-selection--active),
-.model-select-with-icon :deep(.n-base-selection--focused) {
-  background-color: transparent !important;
-  box-shadow: none !important;
+.model-select-integrated :deep(.n-base-selection-input) {
+  color: #374151 !important;
+  font-weight: 500;
+}
+
+.model-select-integrated :deep(.n-base-selection-label) {
+  color: #374151 !important;
+}
+
+.model-select-integrated :deep(.n-base-selection-placeholder__inner) {
+  color: #9CA3AF !important;
+}
+
+/* 模型选项标签样式 */
+.model-option-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  vertical-align: middle;
+  padding-left: 4px;
+}
+
+.model-option-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
+.model-option-text {
+  font-weight: 500;
+  color: #374151;
+  line-height: 16px;
+  vertical-align: middle;
 }
 
 /* 发送按钮 */
